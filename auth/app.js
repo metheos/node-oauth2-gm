@@ -42,88 +42,93 @@ if (loadedTokenSet !== false) {
   //use the GM API token to make an API request
   await testGMAPIRequest(GMAPIToken);
   exit();
+} else {
+  doFullAuthSequence();
 }
-const { authorizationUrl, code_verifier } = await startAuthorizationFlow();
 
-// Store `code_verifier` securely until you need it for the token request
-console.log("Navigate to this URL to authenticate:", authorizationUrl);
+async function doFullAuthSequence() {
+  const { authorizationUrl, code_verifier } = await startAuthorizationFlow();
 
-// You can save `code_verifier` in a session or pass it to the next stage
-console.log("code verifier:", code_verifier);
+  // Store `code_verifier` securely until you need it for the token request
+  console.log("Navigate to this URL to authenticate:", authorizationUrl);
 
-//Follow authentication url
-var authResponse = await getRequest(authorizationUrl);
+  // You can save `code_verifier` in a session or pass it to the next stage
+  console.log("code verifier:", code_verifier);
 
-//get correlation id
-var CorrelationId = getRegexMatch(authResponse.data, "CorrelationId: (.*?) -->");
-//get csrf
-var csrfToken = getRegexMatch(authResponse.data, `\"csrf\":\"(.*?)\"`);
-//get transId/stateproperties
-var transId = getRegexMatch(authResponse.data, `\"transId\":\"(.*?)\"`);
+  //Follow authentication url
+  var authResponse = await getRequest(authorizationUrl);
 
-//send credentials to custom policy endpoint
-const cpe1Url = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-console.log(cpe1Url);
-const cpe1Data = {
-  request_type: "RESPONSE",
-  logonIdentifier: user_email_addr,
-  password: user_password,
-};
-var cpe1Response = await postRequest(cpe1Url, cpe1Data, csrfToken);
+  //get correlation id
+  var CorrelationId = getRegexMatch(authResponse.data, "CorrelationId: (.*?) -->");
+  //get csrf
+  var csrfToken = getRegexMatch(authResponse.data, `\"csrf\":\"(.*?)\"`);
+  //get transId/stateproperties
+  var transId = getRegexMatch(authResponse.data, `\"transId\":\"(.*?)\"`);
 
-//load the page that lets us request the MFA Code
-const mfaRequestURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/api/CombinedSigninAndSignup/confirmed?rememberMe=true&csrf_token=${csrfToken}&tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-//Get MFA request url
-var authResponse = await getRequest(mfaRequestURL);
-//get csrf
-var csrfToken = getRegexMatch(authResponse.data, `\"csrf\":\"(.*?)\"`);
-//get transId/stateproperties
-var transId = getRegexMatch(authResponse.data, `\"transId\":\"(.*?)\"`);
+  //send credentials to custom policy endpoint
+  const cpe1Url = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+  console.log(cpe1Url);
+  const cpe1Data = {
+    request_type: "RESPONSE",
+    logonIdentifier: user_email_addr,
+    password: user_password,
+  };
+  var cpe1Response = await postRequest(cpe1Url, cpe1Data, csrfToken);
 
-// request mfa code
-const cpe2Url = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/SendCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-console.log(cpe2Url);
-const cpe2Data = {
-  emailMfa: user_email_addr,
-};
-var cpe2Response = await postRequest(cpe2Url, cpe2Data, csrfToken);
-var mfaCode = await rl.question("MFA Code from email:");
-// var mfaCode = user_mfa_code;
+  //load the page that lets us request the MFA Code
+  const mfaRequestURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/api/CombinedSigninAndSignup/confirmed?rememberMe=true&csrf_token=${csrfToken}&tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+  //Get MFA request url
+  var authResponse = await getRequest(mfaRequestURL);
+  //get csrf
+  var csrfToken = getRegexMatch(authResponse.data, `\"csrf\":\"(.*?)\"`);
+  //get transId/stateproperties
+  var transId = getRegexMatch(authResponse.data, `\"transId\":\"(.*?)\"`);
 
-//submit MFA code
-const postMFACodeURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/VerifyCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-console.log(postMFACodeURL);
-const MFACodeData = {
-  emailMfa: user_email_addr,
-  verificationCode: mfaCode,
-};
-var MFACodeResponse = await postRequest(postMFACodeURL, MFACodeData, csrfToken);
+  // request mfa code
+  const cpe2Url = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/SendCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+  console.log(cpe2Url);
+  const cpe2Data = {
+    emailMfa: user_email_addr,
+  };
+  var cpe2Response = await postRequest(cpe2Url, cpe2Data, csrfToken);
+  var mfaCode = await rl.question("MFA Code from email:");
+  // var mfaCode = user_mfa_code;
 
-//RESPONSE - not sure what this does, but we need to do it to move on
-const postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-console.log(postMFACodeRespURL);
-const MFACodeDataResp = {
-  emailMfa: user_email_addr,
-  verificationCode: mfaCode,
-  request_type: "RESPONSE",
-};
-var MFACodeResponse = await postRequest(postMFACodeRespURL, MFACodeDataResp, csrfToken);
+  //submit MFA code
+  const postMFACodeURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/VerifyCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+  console.log(postMFACodeURL);
+  const MFACodeData = {
+    emailMfa: user_email_addr,
+    verificationCode: mfaCode,
+  };
+  var MFACodeResponse = await postRequest(postMFACodeURL, MFACodeData, csrfToken);
 
-//Get Auth Code in redirect (This actually contains the 'code' for completing PKCE in the oauth flow)
-const authCodeRequestURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/api/SelfAsserted/confirmed?csrf_token=${csrfToken}&tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-//Get auth Code request url
-var authResponse = await captureRedirectLocation(authCodeRequestURL);
-console.log(authResponse);
-//get 'code'
-var authCode = getRegexMatch(authResponse, `code=(.*)`);
-console.log("Auth Code:", authCode);
+  //RESPONSE - not sure what this does, but we need to do it to move on
+  const postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+  console.log(postMFACodeRespURL);
+  const MFACodeDataResp = {
+    emailMfa: user_email_addr,
+    verificationCode: mfaCode,
+    request_type: "RESPONSE",
+  };
+  var MFACodeResponse = await postRequest(postMFACodeRespURL, MFACodeDataResp, csrfToken);
 
-//use code with verifier to get access token!
-var thisTokenSet = await getAccessToken(authCode, code_verifier);
-console.log(thisTokenSet);
+  //Get Auth Code in redirect (This actually contains the 'code' for completing PKCE in the oauth flow)
+  const authCodeRequestURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/api/SelfAsserted/confirmed?csrf_token=${csrfToken}&tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+  //Get auth Code request url
+  var authResponse = await captureRedirectLocation(authCodeRequestURL);
+  console.log(authResponse);
+  //get 'code'
+  var authCode = getRegexMatch(authResponse, `code=(.*)`);
+  console.log("Auth Code:", authCode);
 
-//save the token set for reuse
-fs.writeFileSync(tokenPath, JSON.stringify(thisTokenSet));
+  //use code with verifier to get MS access token!
+  var thisTokenSet = await getAccessToken(authCode, code_verifier);
+  console.log(thisTokenSet);
+
+  //save the MS token set for reuse
+  fs.writeFileSync(tokenPath, JSON.stringify(thisTokenSet));
+}
 
 //FUNCTIONS
 
@@ -319,6 +324,7 @@ async function setupClient() {
   return client;
 }
 
+//starts PKCE auth
 async function startAuthorizationFlow() {
   const client = await setupClient();
 
