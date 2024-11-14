@@ -2,6 +2,7 @@
   "type": "module",
   "dependencies": {
     "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
     "http-cookie-agent": "^6.0.6",
     "openid-client": "^5.7.0",
     "readline-sync": "^1.4.10",
