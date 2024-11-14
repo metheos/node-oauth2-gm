@@ -12,6 +12,7 @@ import fs from "fs";
 //Variables
 const user_email_addr = "your email address";
 const user_password = "your password";
+// const user_mfa_code = "";
 const user_device_uuid = "your randomly generated uuid";
 const user_vehicle_vin = "your vehicle VIN";
 
@@ -30,11 +31,15 @@ const axiosClient = axios.create({
 });
 
 //Do the things!!
+
+//Try to load a saved token set
 const loadedTokenSet = await loadAccessToken();
 if (loadedTokenSet !== false) {
+  //we already have our MS tokens, let's use them to get the access token for the GM API!
   console.log(loadedTokenSet);
   const GMAPIToken = await getGMAPIToken(loadedTokenSet);
   console.log(GMAPIToken);
+  //use the GM API token to make an API request
   await testGMAPIRequest(GMAPIToken);
   exit();
 }
@@ -66,6 +71,7 @@ const cpe1Data = {
 };
 var cpe1Response = await postRequest(cpe1Url, cpe1Data, csrfToken);
 
+//load the page that lets us request the MFA Code
 const mfaRequestURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/api/CombinedSigninAndSignup/confirmed?rememberMe=true&csrf_token=${csrfToken}&tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
 //Get MFA request url
 var authResponse = await getRequest(mfaRequestURL);
@@ -82,8 +88,9 @@ const cpe2Data = {
 };
 var cpe2Response = await postRequest(cpe2Url, cpe2Data, csrfToken);
 var mfaCode = await rl.question("MFA Code from email:");
+// var mfaCode = user_mfa_code;
 
-//submit code
+//submit MFA code
 const postMFACodeURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/VerifyCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
 console.log(postMFACodeURL);
 const MFACodeData = {
@@ -92,7 +99,7 @@ const MFACodeData = {
 };
 var MFACodeResponse = await postRequest(postMFACodeURL, MFACodeData, csrfToken);
 
-//RESPONSE
+//RESPONSE - not sure what this does, but we need to do it to move on
 const postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
 console.log(postMFACodeRespURL);
 const MFACodeDataResp = {
@@ -102,7 +109,7 @@ const MFACodeDataResp = {
 };
 var MFACodeResponse = await postRequest(postMFACodeRespURL, MFACodeDataResp, csrfToken);
 
-//Get Auth Code in redirect
+//Get Auth Code in redirect (This actually contains the 'code' for completing PKCE in the oauth flow)
 const authCodeRequestURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/api/SelfAsserted/confirmed?csrf_token=${csrfToken}&tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
 //Get auth Code request url
 var authResponse = await captureRedirectLocation(authCodeRequestURL);
@@ -120,13 +127,16 @@ fs.writeFileSync(tokenPath, JSON.stringify(thisTokenSet));
 
 //FUNCTIONS
 
+//Test the GMA API using the GM API token
 async function testGMAPIRequest(GMAPIToken) {
   // Check if access token is expired and refresh if necessary
+  // each GM API token is only good for 30 minutes
   const now = Math.floor(Date.now() / 1000);
   if (GMAPIToken.expires_at < now) {
     GMAPIToken = await getGMAPIToken(loadedTokenSet);
   }
 
+  //Send GM API Request
   const config = {
     withCredentials: true,
     headers: { authorization: `bearer ${GMAPIToken.access_token}`, "content-type": "application/json; charset=UTF-8", accept: "application/json" },
@@ -171,6 +181,8 @@ async function testGMAPIRequest(GMAPIToken) {
     .catch(console.log);
 }
 
+//use the MS token to get a GM API Token
+//these GM API tokens are only valid for 30 minutes
 async function getGMAPIToken(tokenSet) {
   const url = "https://na-mobile-api.gm.com/sec/authz/v3/oauth/token";
   var responseObj;
@@ -205,6 +217,7 @@ async function getGMAPIToken(tokenSet) {
   return responseObj.data;
 }
 
+//little function to make grabbing a regex match simple
 function getRegexMatch(haystack, regexString) {
   let re = new RegExp(regexString);
   let r = haystack.match(re);
@@ -216,6 +229,7 @@ function getRegexMatch(haystack, regexString) {
   }
 }
 
+//post request function for the MS oauth side of things
 async function postRequest(url, postData, csrfToken = "") {
   var responseObj;
   await axiosClient
@@ -242,6 +256,7 @@ async function postRequest(url, postData, csrfToken = "") {
   return responseObj;
 }
 
+//general get request function with cookie support
 async function getRequest(url) {
   var responseObj;
   await axiosClient
@@ -259,6 +274,7 @@ async function getRequest(url) {
   return responseObj;
 }
 
+//this helps grab the MS oauth pkce code response
 async function captureRedirectLocation(url) {
   var result = false;
   try {
@@ -322,6 +338,7 @@ async function startAuthorizationFlow() {
   return { authorizationUrl, code_verifier };
 }
 
+//complete PKCE and get the MS tokens
 async function getAccessToken(code, code_verifier) {
   const client = await setupClient();
 
@@ -339,6 +356,7 @@ async function getAccessToken(code, code_verifier) {
   }
 }
 
+//load any existing tokens and renew them if expired and renewable
 async function loadAccessToken() {
   const client = await setupClient();
   var tokenSet;
