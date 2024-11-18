@@ -46,7 +46,7 @@ const axiosClient = axios.create({
 var GMAPIToken = null;
 
 //Try to load a saved token set
-const loadedTokenSet = await loadAccessToken();
+var loadedTokenSet = await loadAccessToken();
 if (loadedTokenSet !== false) {
   //we already have our MS tokens, let's use them to get the access token for the GM API!
   // console.log(loadedTokenSet);
@@ -54,6 +54,7 @@ if (loadedTokenSet !== false) {
 } else {
   console.log("No existing tokens found or were invalid. Doing full auth sequence.");
   await doFullAuthSequence();
+  loadedTokenSet = await loadAccessToken();
 }
 //use the GM API token to make an API request
 GMAPIToken = await getGMAPIToken(loadedTokenSet);
