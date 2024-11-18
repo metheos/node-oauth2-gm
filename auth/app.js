@@ -53,13 +53,28 @@ if (loadedTokenSet !== false) {
   console.log("Existing tokens loaded!");
 } else {
   console.log("No existing tokens found or were invalid. Doing full auth sequence.");
-  await doFullAuthSequence();
+  try {
+    await doFullAuthSequence();
+  } catch (error) {
+    console.error("Authentication sequence failed:", error.message);
+    process.exit(1);
+  }
   loadedTokenSet = await loadAccessToken();
 }
 //use the GM API token to make an API request
-GMAPIToken = await getGMAPIToken(loadedTokenSet);
+try {
+  GMAPIToken = await getGMAPIToken(loadedTokenSet);
+} catch (error) {
+  console.error("Authentication sequence failed:", error.message);
+  process.exit(1);
+}
 console.log(GMAPIToken);
-await testGMAPIRequest(GMAPIToken);
+try {
+  await testGMAPIRequest(GMAPIToken);
+} catch (error) {
+  console.error("API Test failed:", error.message);
+  process.exit(1);
+}
 
 async function doFullAuthSequence() {
   const { authorizationUrl, code_verifier } = await startAuthorizationFlow();
@@ -166,99 +181,122 @@ async function doFullAuthSequence() {
 }
 
 //FUNCTIONS
-
-//Test the GMA API using the GM API token
-async function testGMAPIRequest(GMAPIToken) {
-  console.log("Testing GM API Request");
-  // Check if access token is expired and refresh if necessary
-  // each GM API token is only good for 30 minutes
-  const now = Math.floor(Date.now() / 1000);
-  if (GMAPIToken.expires_at < now) {
-    GMAPIToken = await getGMAPIToken(loadedTokenSet);
-  }
-
-  //Send GM API Request
-  const config = {
-    withCredentials: true,
-    headers: { authorization: `bearer ${GMAPIToken.access_token}`, "content-type": "application/json; charset=UTF-8", accept: "application/json" },
-  };
-
-  const postData = {
-    diagnosticsRequest: {
-      diagnosticItem: [
-        "TARGET CHARGE LEVEL SETTINGS",
-        "LAST TRIP FUEL ECONOMY",
-        "PREF CHARGING TIMES SETTING",
-        "ENERGY EFFICIENCY",
-        "LIFETIME ENERGY USED",
-        "ESTIMATED CABIN TEMPERATURE",
-        "EV BATTERY LEVEL",
-        "HV BATTERY CHARGE COMPLETE TIME",
-        "HIGH VOLTAGE BATTERY PRECONDITIONING STATUS",
-        "EV PLUG VOLTAGE",
-        "HOTSPOT CONFIG",
-        "ODOMETER",
-        "HOTSPOT STATUS",
-        "LIFETIME EV ODOMETER",
-        "CHARGER POWER LEVEL",
-        "CABIN PRECONDITIONING TEMP CUSTOM SETTING",
-        "EV PLUG STATE",
-        "EV CHARGE STATE",
-        "TIRE PRESSURE",
-        "LOCATION BASE CHARGE SETTING",
-        "LAST TRIP DISTANCE",
-        "CABIN PRECONDITIONING REQUEST",
-        "GET COMMUTE SCHEDULE",
-        "GET CHARGE MODE",
-        "PREF CHARGING TIMES PLAN",
-        "VEHICLE RANGE",
-      ],
-    },
-  };
-
-  await axiosClient
-    .post(`https://na-mobile-api.gm.com/api/v1/account/vehicles/${user_vehicle_vin}/commands/diagnostics`, postData, config)
-    .then(console.log)
-    .catch(console.log);
-}
-
-//use the MS token to get a GM API Token
-//these GM API tokens are only valid for 30 minutes
 async function getGMAPIToken(tokenSet) {
   console.log("Requesting GM API Token using MS Access Token");
   const url = "https://na-mobile-api.gm.com/sec/authz/v3/oauth/token";
-  var responseObj;
-  const postData = {
-    grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
-    subject_token: tokenSet.access_token,
-    subject_token_type: "urn:ietf:params:oauth:token-type:access_token",
-    scope: "msso role_owner priv onstar gmoc user user_trailer",
-    device_id: user_device_uuid,
-  };
-  await axiosClient
-    .post(url, postData, {
-      withCredentials: true,
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        accept: "application/json",
-      },
-    })
-    .then((response) => {
-      console.log("Response Status:", response.status);
-      // console.log("Response Status:", response.statusText);
-      // console.log("Response Headers:", response.headers);
-      // console.log("Response:", response.data);
-      // console.log(response.CookieJar.cookies);
-      responseObj = response;
-    })
-    .catch((error) => {
-      console.error("Error:", error.message);
-    });
-  const expires_at = Math.floor(new Date() / 1000) + parseInt(responseObj.data.expires_in);
-  responseObj.data.expires_at = expires_at;
 
-  console.log("Set GM Token expiration to ", expires_at);
-  return responseObj.data;
+  try {
+    const response = await axiosClient.post(
+      url,
+      {
+        grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+        subject_token: tokenSet.access_token,
+        subject_token_type: "urn:ietf:params:oauth:token-type:access_token",
+        scope: "msso role_owner priv onstar gmoc user user_trailer",
+        device_id: user_device_uuid,
+      },
+      {
+        withCredentials: true,
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          accept: "application/json",
+        },
+      }
+    );
+
+    const expires_at = Math.floor(new Date() / 1000) + parseInt(response.data.expires_in);
+    response.data.expires_at = expires_at;
+    console.log("Set GM Token expiration to ", expires_at);
+    return response.data;
+  } catch (error) {
+    if (error.response) {
+      console.error(`GM API Token Error ${error.response.status}: ${error.response.statusText}`);
+      console.error("Error details:", error.response.data);
+      if (error.response.status === 401) {
+        console.error("Token exchange failed. MS Access token may be invalid.");
+      }
+    } else if (error.request) {
+      console.error("No response received from GM API");
+      console.error(error.request);
+    } else {
+      console.error("Request Error:", error.message);
+    }
+    throw error;
+  }
+}
+//Test the GMA API using the GM API token
+async function testGMAPIRequest(GMAPIToken) {
+  console.log("Testing GM API Request");
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    if (GMAPIToken.expires_at < now) {
+      console.log("Token expired, refreshing...");
+      GMAPIToken = await getGMAPIToken(loadedTokenSet);
+    }
+
+    const postData = {
+      diagnosticsRequest: {
+        diagnosticItem: [
+          "TARGET CHARGE LEVEL SETTINGS",
+          "LAST TRIP FUEL ECONOMY",
+          "PREF CHARGING TIMES SETTING",
+          "ENERGY EFFICIENCY",
+          "LIFETIME ENERGY USED",
+          "ESTIMATED CABIN TEMPERATURE",
+          "EV BATTERY LEVEL",
+          "HV BATTERY CHARGE COMPLETE TIME",
+          "HIGH VOLTAGE BATTERY PRECONDITIONING STATUS",
+          "EV PLUG VOLTAGE",
+          "HOTSPOT CONFIG",
+          "ODOMETER",
+          "HOTSPOT STATUS",
+          "LIFETIME EV ODOMETER",
+          "CHARGER POWER LEVEL",
+          "CABIN PRECONDITIONING TEMP CUSTOM SETTING",
+          "EV PLUG STATE",
+          "EV CHARGE STATE",
+          "TIRE PRESSURE",
+          "LOCATION BASE CHARGE SETTING",
+          "LAST TRIP DISTANCE",
+          "CABIN PRECONDITIONING REQUEST",
+          "GET COMMUTE SCHEDULE",
+          "GET CHARGE MODE",
+          "PREF CHARGING TIMES PLAN",
+          "VEHICLE RANGE",
+        ],
+      },
+    };
+
+    const response = await axiosClient.post(
+      `https://na-mobile-api.gm.com/api/v1/account/vehicles/${user_vehicle_vin}/commands/diagnostics`,
+      postData,
+      {
+        withCredentials: true,
+        headers: {
+          authorization: `bearer ${GMAPIToken.access_token}`,
+          "content-type": "application/json; charset=UTF-8",
+          accept: "application/json",
+        },
+      }
+    );
+
+    console.log("Diagnostic request successful:", response.data);
+    return response.data;
+  } catch (error) {
+    if (error.response) {
+      console.error(`GM API Request Error ${error.response.status}: ${error.response.statusText}`);
+      console.error("Error details:", error.response.data);
+      if (error.response.status === 401) {
+        console.error("Authentication failed. Token may be invalid.");
+      }
+    } else if (error.request) {
+      console.error("No response received from GM API");
+      console.error(error.request);
+    } else {
+      console.error("Request Error:", error.message);
+    }
+    throw error;
+  }
 }
 
 //little function to make grabbing a regex match simple
@@ -275,9 +313,8 @@ function getRegexMatch(haystack, regexString) {
 
 //post request function for the MS oauth side of things
 async function postRequest(url, postData, csrfToken = "") {
-  var responseObj;
-  await axiosClient
-    .post(url, postData, {
+  try {
+    const response = await axiosClient.post(url, postData, {
       withCredentials: true,
       headers: {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -285,66 +322,82 @@ async function postRequest(url, postData, csrfToken = "") {
         origin: "https://custlogin.gm.com",
         "x-csrf-token": csrfToken,
       },
-    })
-    .then((response) => {
-      console.log("Response Status:", response.status);
-      // console.log("Response Status:", response.statusText);
-      // console.log("Response Headers:", response.headers);
-      // console.log("Response:", response.data);
-      // console.log(response.CookieJar.cookies);
-      responseObj = response;
-    })
-    .catch((error) => {
-      console.error("Error:", error.message);
     });
-  return responseObj;
+    console.log("Response Status:", response.status);
+    return response;
+  } catch (error) {
+    if (error.response) {
+      console.error(`HTTP Error ${error.response.status}: ${error.response.statusText}`);
+      console.error("Response data:", error.response.data);
+      if (error.response.status === 401) {
+        console.error("Authentication failed. Please check your credentials.");
+      }
+    } else if (error.request) {
+      console.error("No response received from server");
+      console.error(error.request);
+    } else {
+      console.error("Request Error:", error.message);
+    }
+    throw error;
+  }
 }
 
 //general get request function with cookie support
 async function getRequest(url) {
-  var responseObj;
-  await axiosClient
-    .get(url, { withCredentials: true, maxRedirects: 0 })
-    .then((response) => {
-      console.log("Response Status:", response.status);
-      // console.log("Response Status:", response.statusText);
-      // console.log("Response Headers:", response.headers);
-      // console.log("Response:", response.data);
-      responseObj = response;
-    })
-    .catch((error) => {
-      console.error("Error:", error.message);
-    });
-  return responseObj;
+  try {
+    const response = await axiosClient.get(url, { withCredentials: true, maxRedirects: 0 });
+    console.log("Response Status:", response.status);
+    return response;
+  } catch (error) {
+    if (error.response) {
+      // Server responded with error status
+      console.error(`HTTP Error ${error.response.status}: ${error.response.statusText}`);
+      console.error("Response data:", error.response.data);
+    } else if (error.request) {
+      // Request made but no response received
+      console.error("No response received from server");
+      console.error(error.request);
+    } else {
+      // Error in request setup
+      console.error("Request Error:", error.message);
+    }
+    throw error;
+  }
 }
 
 //this helps grab the MS oauth pkce code response
 async function captureRedirectLocation(url) {
   console.log("Requesting PKCE code");
-  var result = false;
   try {
     const response = await axiosClient.get(url, {
-      maxRedirects: 0, // Prevent Axios from following redirects
+      maxRedirects: 0,
       validateStatus: function (status) {
-        // Accept any status code in the 300 range (or any other as needed)
         return status >= 200 && status < 400;
       },
     });
 
     if (response.status === 302) {
-      // Capture the `Location` header
       const redirectLocation = response.headers["location"];
-      // console.log("Redirect Location:", redirectLocation);
-      result = redirectLocation;
+      if (!redirectLocation) {
+        throw new Error("No redirect location found in response headers");
+      }
+      return redirectLocation;
     } else {
-      // console.log("Response received:", response.data);
+      console.log("Unexpected response status:", response.status);
+      return false;
     }
   } catch (error) {
-    // Handle errors (e.g., network issues) that are not redirect-related
-    console.error("Error:", error.message);
+    if (error.response) {
+      console.error(`Redirect Error ${error.response.status}: ${error.response.statusText}`);
+      console.error("Response data:", error.response.data);
+    } else if (error.request) {
+      console.error("No response received while capturing redirect");
+      console.error(error.request);
+    } else {
+      console.error("Request Error:", error.message);
+    }
+    throw error;
   }
-
-  return result;
 }
 
 // Discover the issuer
