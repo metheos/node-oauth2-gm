@@ -10,6 +10,8 @@ import * as openidClient from "openid-client";
 
 import fs from "fs";
 
+import { TOTP } from "totp-generator";
+
 //Variables
 dotenv.config();
 const user_email_addr = process.env.EMAIL;
@@ -17,6 +19,7 @@ const user_password = process.env.PASSWORD;
 // const user_mfa_code = "";
 const user_device_uuid = process.env.UUID;
 const user_vehicle_vin = process.env.VIN;
+const user_totp_key = process.env.TOTPKEY;
 
 console.log(user_email_addr);
 
@@ -48,13 +51,13 @@ if (loadedTokenSet !== false) {
   //we already have our MS tokens, let's use them to get the access token for the GM API!
   // console.log(loadedTokenSet);
   console.log("Existing tokens loaded!");
-  GMAPIToken = await getGMAPIToken(loadedTokenSet);
-  // console.log(GMAPIToken);
 } else {
   console.log("No existing tokens found or were invalid. Doing full auth sequence.");
-  doFullAuthSequence();
+  await doFullAuthSequence();
 }
 //use the GM API token to make an API request
+GMAPIToken = await getGMAPIToken(loadedTokenSet);
+console.log(GMAPIToken);
 await testGMAPIRequest(GMAPIToken);
 
 async function doFullAuthSequence() {
@@ -88,6 +91,7 @@ async function doFullAuthSequence() {
   var cpe1Response = await postRequest(cpe1Url, cpe1Data, csrfToken);
 
   //load the page that lets us request the MFA Code
+  console.log("Loading MFA Page");
   const mfaRequestURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/api/CombinedSigninAndSignup/confirmed?rememberMe=true&csrf_token=${csrfToken}&tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
   //Get MFA request url
   var authResponse = await getRequest(mfaRequestURL);
@@ -96,36 +100,51 @@ async function doFullAuthSequence() {
   //get transId/stateproperties
   var transId = getRegexMatch(authResponse.data, `\"transId\":\"(.*?)\"`);
 
-  // request mfa code
-  console.log("Requesting MFA Code. Check your email!");
-  const cpe2Url = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/SendCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-  // console.log(cpe2Url);
-  const cpe2Data = {
-    emailMfa: user_email_addr,
-  };
-  var cpe2Response = await postRequest(cpe2Url, cpe2Data, csrfToken);
-  var mfaCode = await rl.question("MFA Code from email:");
-  // var mfaCode = user_mfa_code;
-
-  //submit MFA code
-  console.log("Submitting MFA Code.");
-  const postMFACodeURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/VerifyCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-  // console.log(postMFACodeURL);
-  const MFACodeData = {
-    emailMfa: user_email_addr,
-    verificationCode: mfaCode,
-  };
-  var MFACodeResponse = await postRequest(postMFACodeURL, MFACodeData, csrfToken);
-
-  //RESPONSE - not sure what this does, but we need to do it to move on
+  //GENERATE AND SUBMIT TOTP CODE
+  const { otp, expires } = TOTP.generate(user_totp_key, {
+    digits: 6,
+    algorithm: "SHA-1",
+    period: 30,
+  });
+  console.log("Submitting OTP Code:", otp);
   const postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
   // console.log(postMFACodeRespURL);
   const MFACodeDataResp = {
-    emailMfa: user_email_addr,
-    verificationCode: mfaCode,
+    otpCode: otp,
     request_type: "RESPONSE",
   };
   var MFACodeResponse = await postRequest(postMFACodeRespURL, MFACodeDataResp, csrfToken);
+
+  // // request mfa code
+  // console.log("Requesting MFA Code. Check your email!");
+  // const cpe2Url = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/SendCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+  // // console.log(cpe2Url);
+  // const cpe2Data = {
+  //   emailMfa: user_email_addr,
+  // };
+  // var cpe2Response = await postRequest(cpe2Url, cpe2Data, csrfToken);
+  // var mfaCode = await rl.question("MFA Code from email:");
+  // // var mfaCode = user_mfa_code;
+
+  // //submit MFA code
+  // console.log("Submitting MFA Code.");
+  // const postMFACodeURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/VerifyCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+  // // console.log(postMFACodeURL);
+  // const MFACodeData = {
+  //   emailMfa: user_email_addr,
+  //   verificationCode: mfaCode,
+  // };
+  // var MFACodeResponse = await postRequest(postMFACodeURL, MFACodeData, csrfToken);
+
+  // //RESPONSE - not sure what this does, but we need to do it to move on
+  // const postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+  // // console.log(postMFACodeRespURL);
+  // const MFACodeDataResp = {
+  //   emailMfa: user_email_addr,
+  //   verificationCode: mfaCode,
+  //   request_type: "RESPONSE",
+  // };
+  // var MFACodeResponse = await postRequest(postMFACodeRespURL, MFACodeDataResp, csrfToken);
 
   //Get Auth Code in redirect (This actually contains the 'code' for completing PKCE in the oauth flow)
   const authCodeRequestURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/api/SelfAsserted/confirmed?csrf_token=${csrfToken}&tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
