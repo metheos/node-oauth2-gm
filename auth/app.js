@@ -10,7 +10,7 @@ import fs from "fs";
 import { TOTP } from "totp-generator";
 
 import superagent from "superagent";
-import superagentProxy from "superagent-proxy";
+// import superagentProxy from "superagent-proxy";
 import querystring from "querystring";
 
 //Variables
@@ -37,9 +37,9 @@ const rl = readline.createInterface({ input, output });
 const { Issuer, generators } = openidClient;
 
 //PROXY SUPPORT
-const proxyURL = "http://127.0.0.1:8000";
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-superagentProxy(superagent);
+// const proxyURL = "http://127.0.0.1:8000";
+// process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+// superagentProxy(superagent);
 
 const agent = superagent.agent();
 
@@ -89,7 +89,10 @@ async function doFullAuthSequence() {
   console.log("got PKCE code verifier:", code_verifier);
 
   //Follow authentication url
+  console.log("Loading Auth URL");
   var authResponse = await getRequest(authorizationUrl);
+
+  await getRequest("https://accounts.gm.com/common/login/index.html", false);
 
   //get correlation id
   // var CorrelationId = getRegexMatch(authResponse.body, "CorrelationId: (.*?) -->");
@@ -187,23 +190,21 @@ async function doFullAuthSequence() {
     case "SMS":
       const SMS_PRE = getRegexMatch(authResponse.text, '"PRE": *"(.*?)"');
 
-      //load MFA CONFIG
-      console.log("Loading MFA Config");
-      const mfaConfigURL = `https://accounts.gm.com/mfa/ui/config`;
-      //Get MFA request url
-      var mfaConfigResponse = await getRequest(mfaConfigURL);
-      //load MFA TRANSLATIONS
-      console.log("Loading MFA Translations");
-      const mfaTransURL = `https://accounts.gm.com/mfa/cms/en-US/translations`;
-      //Get MFA request url
-      var mfaTransResponse = await getRequest(mfaTransURL);
+      //load MFA
+      // var mfaJunk = null;
+      // mfaJunk = await getRequest(`https://accounts.gm.com/mfa/ui/`);
+      // mfaJunk = await getRequest(`https://accounts.gm.com/mfa/ui/config`);
+      // mfaJunk = await getRequest(`https://accounts.gm.com/mfa/cms/en-US/translations`);
+      // mfaJunk = await getRequest(`https://accounts.gm.com/mfa/assets/styles/v2-gbds-override.css`);
 
       // SEND SMS MFA CODE
+
       console.log("Requesting MFA Code. Check your messages!");
       const smsSendUrl = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/phoneVerificationControl-readOnly/SendCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
       // console.log(cpe2Url);
-      const smsSendData = `&strongAuthenticationPhoneNumber=${SMS_PRE}`;
-      var smsSendResponse = await postRequest(smsSendUrl, smsSendData, csrfToken);
+      // const smsSendData = `&strongAuthenticationPhoneNumber=${SMS_PRE}`;
+      const smsSendData = `&strongAuthenticationPhoneNumber=XXXX-XXX-7637`;
+      var smsSendResponse = await postRequest(smsSendUrl, smsSendData, csrfToken, true);
       console.log(smsSendResponse.text);
       if (smsSendResponse.text.message.includes(`HTTP error response with Code '429'`)) {
         console.log("SMS Request Rate Limit Exceeded. Please try again later.");
@@ -269,7 +270,7 @@ async function getGMAPIToken(tokenSet) {
   try {
     const response = await agent
       .post(url)
-      .proxy(proxyURL)
+      // .proxy(proxyURL)
       .type("form")
       .send(
         querystring.stringify({
@@ -282,7 +283,7 @@ async function getGMAPIToken(tokenSet) {
       )
       .withCredentials()
       .set("Content-Type", "application/x-www-form-urlencoded")
-      .set("accept", "application/json");
+      .set("Accept", "application/json");
 
     const expires_at = Math.floor(new Date() / 1000) + parseInt(response.body.expires_in);
     response.body.expires_at = expires_at;
@@ -349,13 +350,13 @@ async function testGMAPIRequest(GMAPIToken) {
 
     const response = await agent
       .post(`https://na-mobile-api.gm.com/api/v1/account/vehicles/${user_vehicle_vin}/commands/diagnostics`)
-      .proxy(proxyURL)
+      // .proxy(proxyURL)
       .type("json")
       .send(postData)
       .withCredentials()
       .set("authorization", `bearer ${GMAPIToken.access_token}`)
       .set("content-type", "application/json; charset=UTF-8")
-      .set("accept", "application/json");
+      .set("Accept", "application/json");
 
     console.log("Diagnostic request successful:", response.body);
     return response.body;
@@ -389,18 +390,29 @@ function getRegexMatch(haystack, regexString) {
 }
 
 //post request function for the MS oauth side of things
-async function postRequest(url, postData, csrfToken = "") {
-  const serializedData = querystring.stringify(postData);
+async function postRequest(url, postData, csrfToken = "", preserialized = false) {
+  if (!preserialized) {
+    postData = querystring.stringify(postData);
+  } else {
+    console.log(postData);
+  }
   try {
     const response = await agent
       .post(url)
-      .proxy(proxyURL)
+      // .proxy(proxyURL)
       .type("form")
-      .send(serializedData)
+      .send(postData)
       .withCredentials()
+      .set("Connection", "keep-alive")
+      .timeout(90000)
+      .set("Accept-Encoding", "gzip, deflate, br")
+      .set("Accept-Language", "en-US,en;q=0.9")
+      .set("Referer", lastLoadedURL)
+      .set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 15_8_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148")
       .set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-      .set("accept", "application/json, text/javascript, */*; q=0.01")
-      .set("origin", "https://custlogin.gm.com")
+      .set("Accept", "application/json, text/javascript, */*; q=0.01")
+      .set("Origin", "https://custlogin.gm.com")
+      .set("X-Requested-With", "XMLHttpRequest")
       .set("X-CSRF-TOKEN", csrfToken);
     lastLoadedURL = url;
     return response;
@@ -422,10 +434,19 @@ async function postRequest(url, postData, csrfToken = "") {
 }
 
 //general get request function with cookie support
-async function getRequest(url) {
+async function getRequest(url, setRefer = true) {
   try {
-    const response = await agent.get(url).proxy(proxyURL).withCredentials().redirects(0).accept("*/*").set("origin", "https://custlogin.gm.com");
-    lastLoadedURL = url;
+    const response = await agent
+      .get(url)
+      // .proxy(proxyURL)
+      .withCredentials()
+      .accept("*/*")
+      .set("Referer", lastLoadedURL)
+      .set("origin", "https://custlogin.gm.com")
+      .set("Connection", "keep-alive")
+      .set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 15_8_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148");
+    if (setRefer) lastLoadedURL = url;
+
     console.log("Response Status:", response.status);
     return response;
   } catch (error) {
