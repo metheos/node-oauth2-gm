@@ -3,3 +3,6 @@ package-lock.json
 node_modules
 .env
 .vscode
+*.exe
+*.blob
+bundle.js
