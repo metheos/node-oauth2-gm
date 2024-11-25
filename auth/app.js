@@ -1,3 +1,5 @@
+process.removeAllListeners("warning");
+
 import dotenv from "dotenv";
 import * as readline from "node:readline/promises";
 import { exit, stdin as input, stdout as output } from "node:process";
@@ -8,24 +10,7 @@ import querystring from "querystring";
 import puppeteer, { Browser, KnownDevices } from "puppeteer";
 import superagent from "superagent";
 
-const rl = readline.createInterface({ input, output });
-//Variables
-dotenv.config();
-const user_email_addr = process.env.EMAIL ?? (await rl.question("Enter OnStar account email address:"));
-const user_password = process.env.PASSWORD ?? (await rl.question("Enter OnStar account password:"));
-const user_device_uuid = process.env.UUID ?? "";
-const user_vehicle_vin = process.env.VIN ?? "";
-const user_totp_key = process.env.TOTPKEY ?? "";
-
-// console.log(user_email_addr);
-
-if (user_email_addr == undefined) {
-  console.log("Onstar Account Information must be provided.");
-  exit();
-}
-
-//INIT
-
+//SUPER-INIT
 const tokenPath = "./microsoft_tokens.json"; // Path to the token storage file
 const { Issuer, generators } = openidClient;
 var lastRedirect = null;
@@ -34,56 +19,46 @@ const agent = superagent.agent();
 var GMAPIToken = null;
 //set up browser
 const iPhone = KnownDevices["iPhone 15 Pro Max"];
-// const browser = await puppeteer.launch({ devtools: true });
-const browser = await puppeteer.launch();
-const page = await browser.newPage();
-await page.emulate(iPhone);
+const rl = readline.createInterface({ input, output });
+//set up variables
+var user_email_addr = null;
+var user_password = null;
+var user_device_uuid = null;
+var user_vehicle_vin = null;
+var user_totp_key = null;
 
-//Try to load a saved token set
-var loadedTokenSet = await loadAccessToken();
-if (loadedTokenSet !== false) {
-  //we already have our MS tokens, let's use them to get the access token for the GM API!
-  // console.log(loadedTokenSet);
-  console.log("Existing tokens loaded!");
-} else {
-  console.log("No existing tokens found or were invalid. Doing full auth sequence.");
-  try {
-    await doFullAuthSequence();
-  } catch (error) {
-    console.error("Authentication sequence failed:", error.message);
-    process.exit(1);
-  }
-  loadedTokenSet = await loadAccessToken();
-}
-if (user_device_uuid != "" && user_vehicle_vin != "") {
-  // Get a GM API token and use it to make an API request
-  try {
-    GMAPIToken = await getGMAPIToken(loadedTokenSet);
-  } catch (error) {
-    console.error("Authentication sequence failed:", error.message);
-    process.exit(1);
-  }
-  console.log(GMAPIToken);
-  try {
-    await testGMAPIRequest(GMAPIToken);
-  } catch (error) {
-    console.error("API Test failed:", error.message);
-    process.exit(1);
-  }
-}
-exit();
+// Wrap the main logic in an async function
+async function main() {
+  //Variables
+  dotenv.config();
+  user_email_addr = process.env.EMAIL ?? (await rl.question("Enter OnStar account email address:"));
+  user_password = process.env.PASSWORD ?? (await rl.question("Enter OnStar account password:"));
+  user_device_uuid = process.env.UUID ?? "";
+  user_vehicle_vin = process.env.VIN ?? "";
+  user_totp_key = process.env.TOTPKEY ?? "";
 
-async function doFullAuthSequence() {
-  const { authorizationUrl, code_verifier } = await startAuthorizationFlow();
-  console.log("got PKCE code verifier:", code_verifier);
+  // console.log(user_email_addr);
+
+  if (user_email_addr == undefined) {
+    console.log("Onstar Account Information must be provided.");
+    exit();
+  }
+
+  //INIT
+  // const browser = await puppeteer.launch({ devtools: true });
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+  await page.emulate(iPhone);
 
   // capture background responses
-  await page.setRequestInterception(true);
   page.on("response", async (response) => {
     // Check if the response is a redirect (3xx status code)
     if (response.status() >= 300 && response.status() < 400) {
       // Optionally, you can log the redirect URL or handle it as needed
-      lastRedirect = response.headers()["location"];
+      const thisRedirect = response.headers()["location"];
+      if (thisRedirect.includes("msauth")) {
+        lastRedirect = thisRedirect;
+      }
       // console.log(`Redirect detected: ${lastRedirect}`);
       return; // Exit the function early to avoid further processing
     }
@@ -95,6 +70,51 @@ async function doFullAuthSequence() {
       }
     }
   });
+
+  //Try to load a saved token set
+  var loadedTokenSet = await loadAccessToken();
+  if (loadedTokenSet !== false) {
+    //we already have our MS tokens, let's use them to get the access token for the GM API!
+    // console.log(loadedTokenSet);
+    console.log("Existing tokens loaded!");
+  } else {
+    console.log("No existing tokens found or were invalid. Doing full auth sequence.");
+    try {
+      await doFullAuthSequence(page);
+    } catch (error) {
+      console.error("Authentication sequence failed:", error.message);
+      process.exit(1);
+    }
+    loadedTokenSet = await loadAccessToken();
+  }
+  if (user_device_uuid != "" && user_vehicle_vin != "") {
+    // Get a GM API token and use it to make an API request
+    try {
+      GMAPIToken = await getGMAPIToken(loadedTokenSet);
+    } catch (error) {
+      console.error("Authentication sequence failed:", error.message);
+      process.exit(1);
+    }
+    console.log(GMAPIToken);
+    try {
+      await testGMAPIRequest(GMAPIToken);
+    } catch (error) {
+      console.error("API Test failed:", error.message);
+      process.exit(1);
+    }
+  }
+  exit();
+}
+
+// Call the main function
+main().catch((error) => {
+  console.error("Error in main:", error);
+  exit(1);
+});
+
+async function doFullAuthSequence(page) {
+  const { authorizationUrl, code_verifier } = await startAuthorizationFlow();
+  console.log("got PKCE code verifier:", code_verifier);
 
   //Follow authentication url
   console.log("Loading Auth URL");
@@ -131,6 +151,7 @@ async function doFullAuthSequence() {
 
     case "TOTP":
       //GENERATE AND SUBMIT TOTP CODE
+      var mfaCode = "";
       if (user_totp_key && user_totp_key.trim() != "" && user_totp_key.length >= 16) {
         var totp_secret = user_totp_key;
         if (user_totp_key.includes("secret=")) {
@@ -142,8 +163,10 @@ async function doFullAuthSequence() {
           period: 30,
         });
         console.log("Generating and submitting OTP code:", otp);
+        mfaCode = otp;
+      } else {
+        mfaCode = await rl.question("Enter MFA Code from Authenticator App:");
       }
-      var mfaCode = await rl.question("Enter MFA Code from Authenticator App:");
       await page.locator("#otpCode").fill(mfaCode);
       await page.locator("#continue").click();
       break;
