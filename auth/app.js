@@ -1,51 +1,43 @@
 import dotenv from "dotenv";
-
 import * as readline from "node:readline/promises";
 import { exit, stdin as input, stdout as output } from "node:process";
-
 import * as openidClient from "openid-client";
-
 import fs from "fs";
-
 import { TOTP } from "totp-generator";
-
-import superagent from "superagent";
-// import superagentProxy from "superagent-proxy";
 import querystring from "querystring";
+import puppeteer, { Browser, KnownDevices } from "puppeteer";
+import superagent from "superagent";
 
+const rl = readline.createInterface({ input, output });
 //Variables
 dotenv.config();
-const user_email_addr = process.env.EMAIL;
-const user_password = process.env.PASSWORD;
-const user_device_uuid = process.env.UUID;
-const user_vehicle_vin = process.env.VIN;
-const user_totp_key = process.env.TOTPKEY;
+const user_email_addr = process.env.EMAIL ?? (await rl.question("Enter OnStar account email address:"));
+const user_password = process.env.PASSWORD ?? (await rl.question("Enter OnStar account password:"));
+const user_device_uuid = process.env.UUID ?? "";
+const user_vehicle_vin = process.env.VIN ?? "";
+const user_totp_key = process.env.TOTPKEY ?? "";
 
-console.log(user_email_addr);
+// console.log(user_email_addr);
 
 if (user_email_addr == undefined) {
-  console.log("copy .env.example to .env and enter your account information");
+  console.log("Onstar Account Information must be provided.");
   exit();
 }
 
 //INIT
 
-const tokenPath = "./tokens.json"; // Path to the token storage file
-
-const rl = readline.createInterface({ input, output });
-
+const tokenPath = "./microsoft_tokens.json"; // Path to the token storage file
 const { Issuer, generators } = openidClient;
-
-//PROXY SUPPORT
-// const proxyURL = "http://127.0.0.1:8000";
-// process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-// superagentProxy(superagent);
-
+var lastRedirect = null;
+//set up GM token requestor
 const agent = superagent.agent();
-
-//Do the things!!
 var GMAPIToken = null;
-var lastLoadedURL = "";
+//set up browser
+const iPhone = KnownDevices["iPhone 15 Pro Max"];
+// const browser = await puppeteer.launch({ devtools: true });
+const browser = await puppeteer.launch();
+const page = await browser.newPage();
+await page.emulate(iPhone);
 
 //Try to load a saved token set
 var loadedTokenSet = await loadAccessToken();
@@ -63,173 +55,103 @@ if (loadedTokenSet !== false) {
   }
   loadedTokenSet = await loadAccessToken();
 }
-//use the GM API token to make an API request
-try {
-  GMAPIToken = await getGMAPIToken(loadedTokenSet);
-} catch (error) {
-  console.error("Authentication sequence failed:", error.message);
-  process.exit(1);
-}
-console.log(GMAPIToken);
-try {
-  await testGMAPIRequest(GMAPIToken);
-} catch (error) {
-  console.error("API Test failed:", error.message);
-  process.exit(1);
+if (user_device_uuid != "" && user_vehicle_vin != "") {
+  // Get a GM API token and use it to make an API request
+  try {
+    GMAPIToken = await getGMAPIToken(loadedTokenSet);
+  } catch (error) {
+    console.error("Authentication sequence failed:", error.message);
+    process.exit(1);
+  }
+  console.log(GMAPIToken);
+  try {
+    await testGMAPIRequest(GMAPIToken);
+  } catch (error) {
+    console.error("API Test failed:", error.message);
+    process.exit(1);
+  }
 }
 exit();
 
 async function doFullAuthSequence() {
   const { authorizationUrl, code_verifier } = await startAuthorizationFlow();
-
-  // Store `code_verifier` securely until you need it for the token request
-  // console.log("Navigate to this URL to authenticate:", authorizationUrl);
-
-  // You can save `code_verifier` in a session or pass it to the next stage
   console.log("got PKCE code verifier:", code_verifier);
+
+  // capture background responses
+  await page.setRequestInterception(true);
+  page.on("response", async (response) => {
+    // Check if the response is a redirect (3xx status code)
+    if (response.status() >= 300 && response.status() < 400) {
+      // Optionally, you can log the redirect URL or handle it as needed
+      lastRedirect = response.headers()["location"];
+      // console.log(`Redirect detected: ${lastRedirect}`);
+      return; // Exit the function early to avoid further processing
+    }
+    if (response.url().includes("SendCode")) {
+      const content = await response.text();
+
+      if (content.includes("errorCode")) {
+        throw new Error(`Failed to send SMS Code. See error details for more information: ${content}`);
+      }
+    }
+  });
 
   //Follow authentication url
   console.log("Loading Auth URL");
-  var authResponse = await getRequest(authorizationUrl);
+  await page.goto(authorizationUrl);
+  await page.waitForNetworkIdle({ idleTime: 3000 });
 
-  await getRequest("https://accounts.gm.com/common/login/index.html", false);
+  console.log("Submitting user email and password");
+  await page.locator("#logonIdentifier").fill(user_email_addr);
+  await page.locator("#password").fill(user_password);
+  await page.locator("#next").click();
 
-  //get correlation id
-  // var CorrelationId = getRegexMatch(authResponse.body, "CorrelationId: (.*?) -->");
-  //get csrf
-  var csrfToken = getRegexMatch(authResponse.text, `\"csrf\":\"(.*?)\"`);
-  //get transId/stateproperties
-  var transId = getRegexMatch(authResponse.text, `\"transId\":\"(.*?)\"`);
+  await page.waitForNetworkIdle({ idleTime: 500 });
 
-  //send credentials to custom policy endpoint
-  console.log("Sending GM login credentials");
-  const cpe1Url = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-  // console.log(cpe1Url);
-  const cpe1Data = {
-    request_type: "RESPONSE",
-    logonIdentifier: user_email_addr,
-    password: user_password,
-  };
-  var cpe1Response = await postRequest(cpe1Url, cpe1Data, csrfToken);
-
-  //load the page that lets us request the MFA Code
-  console.log("Loading MFA Page");
-  const mfaRequestURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/api/CombinedSigninAndSignup/confirmed?rememberMe=true&csrf_token=${csrfToken}&tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-  //Get MFA request url
-  var authResponse = await getRequest(mfaRequestURL);
-  //get csrf
-  var csrfToken = getRegexMatch(authResponse.text, `\"csrf\":\"(.*?)\"`);
-  //get transId/stateproperties
-  var transId = getRegexMatch(authResponse.text, `\"transId\":\"(.*?)\"`);
-  // console.log(authResponse.body);
-
+  //HANDLE MFA
   var mfaType = null;
-  if (authResponse.text.includes("otpCode")) {
+  var pageContent = await page.content();
+
+  if (pageContent.includes("otpCode")) {
     mfaType = "TOTP";
   }
-  if (authResponse.text.includes("emailMfa")) {
+  if (pageContent.includes("emailMfa")) {
     mfaType = "EMAIL";
   }
-  if (authResponse.text.includes("strongAuthenticationPhoneNumber")) {
+  if (pageContent.includes("strongAuthenticationPhoneNumber")) {
     mfaType = "SMS";
   }
-  console.log("MFA Type:", mfaType);
-
+  console.log("Determined MFA Type is", mfaType);
   switch (mfaType) {
+    case "SMS":
+      var mfaCode = await rl.question("Enter MFA Code from SMS Message:");
+      await page.locator("#verificationCode").fill(mfaCode);
+      await page.locator("button.verifyCode").click();
+      break;
+
     case "TOTP":
       //GENERATE AND SUBMIT TOTP CODE
-      const { otp, expires } = TOTP.generate(user_totp_key, {
-        digits: 6,
-        algorithm: "SHA-1",
-        period: 30,
-      });
-      console.log("Submitting OTP Code:", otp);
-      var postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-      var MFACodeDataResp = {
-        otpCode: otp,
-        request_type: "RESPONSE",
-      };
-      var MFACodeResponse = await postRequest(postMFACodeRespURL, MFACodeDataResp, csrfToken);
-
+      if (user_totp_key && user_totp_key.trim() != "" && user_totp_key.length >= 16) {
+        var totp_secret = user_totp_key;
+        if (user_totp_key.includes("secret=")) {
+          totp_secret = getRegexMatch(user_totp_key, "secret=(.*?)&");
+        }
+        const { otp, expires } = TOTP.generate(totp_secret, {
+          digits: 6,
+          algorithm: "SHA-1",
+          period: 30,
+        });
+        console.log("Generating and submitting OTP code:", otp);
+      }
+      var mfaCode = await rl.question("Enter MFA Code from Authenticator App:");
+      await page.locator("#otpCode").fill(mfaCode);
+      await page.locator("#continue").click();
       break;
 
     case "EMAIL":
-      // REQUEST EMAIL MFA CODE
-      console.log("Requesting MFA Code. Check your email!");
-      const cpe2Url = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/SendCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-      // console.log(cpe2Url);
-      const cpe2Data = {
-        emailMfa: user_email_addr,
-      };
-      var cpe2Response = await postRequest(cpe2Url, cpe2Data, csrfToken);
-      var mfaCode = await rl.question("MFA Code from email:");
-      // var mfaCode = user_mfa_code;
-
-      //submit MFA code
-      console.log("Submitting MFA Code.");
-      const postMFACodeURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/VerifyCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-      // console.log(postMFACodeURL);
-      const MFACodeData = {
-        emailMfa: user_email_addr,
-        verificationCode: mfaCode,
-      };
-      var MFACodeResponse = await postRequest(postMFACodeURL, MFACodeData, csrfToken);
-
-      //RESPONSE - not sure what this does, but we need to do it to move on
-      var postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-      // console.log(postMFACodeRespURL);
-      var MFACodeDataResp = {
-        emailMfa: user_email_addr,
-        verificationCode: mfaCode,
-        request_type: "RESPONSE",
-      };
-      var MFACodeResponse = await postRequest(postMFACodeRespURL, MFACodeDataResp, csrfToken);
-
-      break;
-
-    case "SMS":
-      const SMS_PRE = getRegexMatch(authResponse.text, '"PRE": *"(.*?)"');
-
-      //load MFA
-      // var mfaJunk = null;
-      // mfaJunk = await getRequest(`https://accounts.gm.com/mfa/ui/`);
-      // mfaJunk = await getRequest(`https://accounts.gm.com/mfa/ui/config`);
-      // mfaJunk = await getRequest(`https://accounts.gm.com/mfa/cms/en-US/translations`);
-      // mfaJunk = await getRequest(`https://accounts.gm.com/mfa/assets/styles/v2-gbds-override.css`);
-
-      // SEND SMS MFA CODE
-
-      console.log("Requesting MFA Code. Check your messages!");
-      const smsSendUrl = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/phoneVerificationControl-readOnly/SendCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-      // console.log(cpe2Url);
-      // const smsSendData = `&strongAuthenticationPhoneNumber=${SMS_PRE}`;
-      const smsSendData = `&strongAuthenticationPhoneNumber=XXXX-XXX-7637`;
-      var smsSendResponse = await postRequest(smsSendUrl, smsSendData, csrfToken, true);
-      console.log(smsSendResponse.text);
-      if (smsSendResponse.text.message.includes(`HTTP error response with Code '429'`)) {
-        console.log("SMS Request Rate Limit Exceeded. Please try again later.");
-        exit();
-      }
-      var mfaCode = await rl.question("MFA Code from SMS:");
-
-      //submit MFA code
-      console.log("Submitting MFA Code.");
-      const postSMSMFACodeURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/phoneVerificationControl-readOnly/VerifyCode?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-      // console.log(postMFACodeURL);
-      const SMSMFACodeData = `&strongAuthenticationPhoneNumber=SMS_PRE&verificationCode=mfaCode`;
-      var MFACodeResponse = await postRequest(postSMSMFACodeURL, SMSMFACodeData, csrfToken);
-      console.log(MFACodeResponse.text);
-
-      //RESPONSE - not sure what this does, but we need to do it to move on
-      var postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-      // console.log(postMFACodeRespURL);
-      var MFACodeDataResp = {
-        strongAuthenticationPhoneNumber: SMS_PRE,
-        verificationCode: mfaCode,
-        request_type: "RESPONSE",
-      };
-      var MFACodeResponse = await postRequest(postMFACodeRespURL, MFACodeDataResp, csrfToken);
-      console.log(MFACodeResponse.text);
+      var mfaCode = await rl.question("Enter MFA Code from Email Message:");
+      await page.locator("#verificationCode").fill(mfaCode);
+      await page.locator("button.verifyCode").click();
       break;
 
     default:
@@ -240,13 +162,13 @@ async function doFullAuthSequence() {
 
   if (mfaType != null) {
     //Get Auth Code in redirect (This actually contains the 'code' for completing PKCE in the oauth flow)
-    const authCodeRequestURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/api/SelfAsserted/confirmed?csrf_token=${csrfToken}&tx=${transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-    //Get auth Code request url
-    var authResponse = await captureRedirectLocation(authCodeRequestURL);
-    // console.log(authResponse);
-    //get 'code'
-    var authCode = getRegexMatch(authResponse, `code=(.*)`);
-    // console.log("Auth Code:", authCode);
+    console.log("Waiting for auth redirect");
+    const redirectUrl = await waitForRedirect();
+    if (!redirectUrl.startsWith("msauth")) {
+      throw new Error(`Did not obtain auth Code! page: ${redirectUrl}`);
+    }
+
+    const authCode = getRegexMatch(redirectUrl, `code=(.*)`);
 
     //use code with verifier to get MS access token!
     var thisTokenSet = await getAccessToken(authCode, code_verifier);
@@ -263,6 +185,25 @@ async function doFullAuthSequence() {
 }
 
 //FUNCTIONS
+
+// Function to wait for lastRedirect to be set
+async function waitForRedirect(timeout = 10000) {
+  // Default timeout of 10 seconds
+  return new Promise((resolve, reject) => {
+    const startTime = Date.now();
+
+    const checkRedirect = setInterval(() => {
+      if (lastRedirect) {
+        clearInterval(checkRedirect);
+        resolve(lastRedirect);
+      } else if (Date.now() - startTime > timeout) {
+        clearInterval(checkRedirect);
+        reject(new Error("Timeout waiting for auth code redirect"));
+      }
+    }, 100); // Check every 100 milliseconds
+  });
+}
+
 async function getGMAPIToken(tokenSet) {
   console.log("Requesting GM API Token using MS Access Token");
   const url = "https://na-mobile-api.gm.com/sec/authz/v3/oauth/token";
@@ -270,7 +211,6 @@ async function getGMAPIToken(tokenSet) {
   try {
     const response = await agent
       .post(url)
-      // .proxy(proxyURL)
       .type("form")
       .send(
         querystring.stringify({
@@ -310,7 +250,7 @@ async function testGMAPIRequest(GMAPIToken) {
   console.log("Testing GM API Request");
   try {
     const now = Math.floor(Date.now() / 1000);
-    if (GMAPIToken.expires_at < now) {
+    if (GMAPIToken.expires_at < now + 5 * 60) {
       console.log("Token expired, refreshing...");
       GMAPIToken = await getGMAPIToken(loadedTokenSet);
     }
@@ -350,7 +290,6 @@ async function testGMAPIRequest(GMAPIToken) {
 
     const response = await agent
       .post(`https://na-mobile-api.gm.com/api/v1/account/vehicles/${user_vehicle_vin}/commands/diagnostics`)
-      // .proxy(proxyURL)
       .type("json")
       .send(postData)
       .withCredentials()
@@ -386,120 +325,6 @@ function getRegexMatch(haystack, regexString) {
     return r[1];
   } else {
     return false;
-  }
-}
-
-//post request function for the MS oauth side of things
-async function postRequest(url, postData, csrfToken = "", preserialized = false) {
-  if (!preserialized) {
-    postData = querystring.stringify(postData);
-  } else {
-    console.log(postData);
-  }
-  try {
-    const response = await agent
-      .post(url)
-      // .proxy(proxyURL)
-      .type("form")
-      .send(postData)
-      .withCredentials()
-      .set("Connection", "keep-alive")
-      .timeout(90000)
-      .set("Accept-Encoding", "gzip, deflate, br")
-      .set("Accept-Language", "en-US,en;q=0.9")
-      .set("Referer", lastLoadedURL)
-      .set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 15_8_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148")
-      .set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-      .set("Accept", "application/json, text/javascript, */*; q=0.01")
-      .set("Origin", "https://custlogin.gm.com")
-      .set("X-Requested-With", "XMLHttpRequest")
-      .set("X-CSRF-TOKEN", csrfToken);
-    lastLoadedURL = url;
-    return response;
-  } catch (error) {
-    if (error.response) {
-      console.error(`HTTP Error ${error.response.status}`);
-      console.error("Response data:", error.response.body);
-      if (error.response.status === 401) {
-        console.error("Authentication failed. Please check your credentials.");
-      }
-    } else if (error.request) {
-      console.error("No response received from server");
-      console.error(error.request);
-    } else {
-      console.error("Request Error:", error.message);
-    }
-    throw error;
-  }
-}
-
-//general get request function with cookie support
-async function getRequest(url, setRefer = true) {
-  try {
-    const response = await agent
-      .get(url)
-      // .proxy(proxyURL)
-      .withCredentials()
-      .accept("*/*")
-      .set("Referer", lastLoadedURL)
-      .set("origin", "https://custlogin.gm.com")
-      .set("Connection", "keep-alive")
-      .set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 15_8_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148");
-    if (setRefer) lastLoadedURL = url;
-
-    console.log("Response Status:", response.status);
-    return response;
-  } catch (error) {
-    if (error.response) {
-      // Server responded with error status
-      console.error(`HTTP Error ${error.response.status}`);
-      console.error("Response data:", error.response.body);
-    } else if (error.request) {
-      // Request made but no response received
-      console.error("No response received from server");
-      console.error(error.request);
-    } else {
-      // Error in request setup
-      console.error("Request Error:", error.message);
-    }
-    throw error;
-  }
-}
-
-//this helps grab the MS oauth pkce code response
-async function captureRedirectLocation(url) {
-  console.log("Requesting PKCE code");
-  try {
-    const response = await agent
-      .get(url)
-      .redirects(0)
-      .ok(function (res) {
-        if (res.status == 302) {
-          return true;
-        } else throw new Error(res.body.message);
-      });
-
-    if (response.status === 302) {
-      const redirectLocation = response.headers["location"];
-      if (!redirectLocation) {
-        throw new Error("No redirect location found in response headers");
-      }
-      return redirectLocation;
-    } else {
-      console.log("Unexpected response status:", response.status);
-      return false;
-    }
-  } catch (error) {
-    if (error.response) {
-      console.error(`Redirect Error ${error.response.status}`);
-      console.error("Response data:", error.response.text);
-    } else if (error.request) {
-      console.error("No response received while capturing redirect");
-      console.error(error.request);
-    } else {
-      console.error("Request Error:", error.message);
-    }
-    throw error;
   }
 }
 
@@ -571,7 +396,7 @@ async function loadAccessToken() {
 
     // Check if access token is expired and refresh if necessary
     const now = Math.floor(Date.now() / 1000);
-    if (storedTokens.expires_at > now) {
+    if (storedTokens.expires_at > now + 5 * 60) {
       // Access token is still valid
       console.log("MS Access token is still valid");
       tokenSet = storedTokens;

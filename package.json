@@ -3,9 +3,10 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "openid-client": "^5.7.0",
+    "playwright": "^1.49.0",
+    "puppeteer": "^23.9.0",
     "readline-sync": "^1.4.10",
     "superagent": "^10.1.1",
-    "superagent-proxy": "^3.0.0",
     "totp-generator": "^1.0.0"
   }
 }
