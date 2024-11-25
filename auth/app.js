@@ -1,5 +1,3 @@
-process.removeAllListeners("warning");
-
 import dotenv from "dotenv";
 import * as readline from "node:readline/promises";
 import { exit, stdin as input, stdout as output } from "node:process";
