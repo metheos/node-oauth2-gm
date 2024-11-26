@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 import * as readline from "node:readline/promises";
 import { exit, stdin as input, stdout as output } from "node:process";
 import * as openidClient from "openid-client";
+import { custom } from "openid-client";
 import fs from "fs";
 import { TOTP } from "totp-generator";
 import querystring from "querystring";
@@ -363,6 +364,7 @@ async function setupClient() {
     response_types: ["code"],
     token_endpoint_auth_method: "none",
   });
+  client[custom.clock_tolerance] = 60; // to allow a 60 second skew
 
   return client;
 }
