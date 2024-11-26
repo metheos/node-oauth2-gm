@@ -3,16 +3,16 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "openid-client": "^5.7.0",
-    "puppeteer": "^23.9.0",
     "readline-sync": "^1.4.10",
     "superagent": "^10.1.1",
     "totp-generator": "^1.0.0",
     "typescript": "^5.7.2"
   },
   "devDependencies": {
+    "@yao-pkg/pkg": "^6.1.1",
     "esbuild": "^0.24.0"
   },
   "scripts": {
-    "build": "npx esbuild --format=cjs --target=node20 --platform=node --bundle --outfile=bundle.js ./auth/app.js && node --experimental-sea-config sea-config.json && node -e \"require('fs').copyFileSync(process.execPath, 'GMAuth.exe')\" && npx postject GMAuth.exe NODE_SEA_BLOB sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2"
+    "build": ""
   }
 }

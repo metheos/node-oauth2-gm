@@ -6,4 +6,6 @@ node_modules
 *.exe
 *.blob
 bundle.js
-./app-*
+/app-*
+.cache
+/puppeteer
