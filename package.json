@@ -17,6 +17,7 @@
     "ncc": "^0.3.6"
   },
   "scripts": {
-    "build": ""
+    "start": "node ./src/app.mjs",
+    "build": "npx babel --plugins @babel/plugin-transform-modules-commonjs src -d build/babel/lib && npx pkg --compress GZip --target latest-win-x64 -o build/GM-MS-TOKENS.exe ./build/babel/lib/app.js"
   }
 }
