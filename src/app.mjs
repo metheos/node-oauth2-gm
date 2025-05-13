@@ -165,21 +165,75 @@ class GMAuth {
     if (mfaType == null) {
       throw new Error("Could not determine MFA Type. Bad email or password?");
     }
-    if (mfaType !== "TOTP") {
-      throw new Error(`Only TOTP via "Third-Party Authenticator" is currently supported. Please update your OnStar account.`);
-    }
+    console.log("Determined MFA Type is", mfaType);
+    switch (mfaType) {
+      case "SMS":
+        throw new Error("SMS is not implemented! Sorry!");
+        break;
 
-    var totp_secret = this.config.totpKey.trim();
-    if (totp_secret.includes("secret=")) {
-      const match = this.getRegexMatch(totp_secret, "secret=(.*?)&");
-      totp_secret = match ?? totp_secret;
-    }
+      case "TOTP":
+        //GENERATE AND SUBMIT TOTP CODE
+        var mfaCode = "";
+        if (user_totp_key && user_totp_key.trim() != "" && user_totp_key.length >= 16) {
+          var totp_secret = user_totp_key;
+          if (user_totp_key.includes("secret=")) {
+            totp_secret = getRegexMatch(user_totp_key, "secret=(.*?)&");
+          }
+          const { otp, expires } = TOTP.generate(totp_secret, {
+            digits: 6,
+            algorithm: "SHA-1",
+            period: 30,
+          });
+          console.log("Generating and submitting OTP code:", otp);
+          mfaCode = otp;
+        } else {
+          mfaCode = await rl.question("Enter MFA Code from Authenticator App:");
+        }
+        console.log("Submitting OTP Code:", mfaCode);
+        var postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${this.transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+        var MFACodeDataResp = {
+          otpCode: mfaCode,
+          request_type: "RESPONSE",
+        };
+        var MFACodeResponse = await this.postRequest(postMFACodeRespURL, MFACodeDataResp, this.csrfToken);
+        break;
 
-    const { otp } = TOTP.generate(totp_secret, { digits: 6, algorithm: "SHA-1", period: 30 });
-    if (this.debugMode) console.log("Submitting OTP Code:", otp);
-    const postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${this.transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-    const MFACodeDataResp = { otpCode: otp, request_type: "RESPONSE" };
-    await this.postRequest(postMFACodeRespURL, MFACodeDataResp, this.csrfToken);
+      case "EMAIL":
+        // REQUEST EMAIL MFA CODE
+        console.log("Requesting MFA Code. Check your email!");
+        const cpe2Url = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/SendCode?tx=${this.transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+        const cpe2Data = {
+          emailMfa: user_email_addr,
+        };
+        var cpe2Response = await this.postRequest(cpe2Url, cpe2Data, this.csrfToken);
+        var mfaCode = await rl.question("Enter MFA Code from Email Message:");
+
+        //submit MFA code
+        console.log("Submitting MFA Code.");
+        const postMFACodeURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/VerifyCode?tx=${this.transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+        // console.log(postMFACodeURL);
+        const MFACodeData = {
+          emailMfa: user_email_addr,
+          verificationCode: mfaCode,
+        };
+        var MFACodeResponse = await this.postRequest(postMFACodeURL, MFACodeData, this.csrfToken);
+
+        //RESPONSE - not sure what this does, but we need to do it to move on
+        var postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${this.transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+        // console.log(postMFACodeRespURL);
+        var MFACodeDataResp = {
+          emailMfa: user_email_addr,
+          verificationCode: mfaCode,
+          request_type: "RESPONSE",
+        };
+        var MFACodeResponse = await this.postRequest(postMFACodeRespURL, MFACodeDataResp, this.csrfToken);
+        break;
+
+      default:
+        console.log("Could not determine MFA Type. Bad email or password?");
+        exit();
+        break;
+    }
   }
 
   async submitCredentials() {
