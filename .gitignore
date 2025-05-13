@@ -1,5 +1,7 @@
 *tokens.json
 package-lock.json
+dist
+build
 node_modules
 .env
 .vscode
