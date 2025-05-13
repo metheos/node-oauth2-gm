@@ -1,5 +1,5 @@
 # Instructions for Use
-1. Downloand and run the exe file from: 
+1. Download and and run the exe file from: 
     * https://github.com/metheos/node-oauth2-gm/releases/
       * It will generate "microsoft_tokens.json" in the same folder where you have run GM-MS-TOKENS.exe
 2. In Home Assistant (HA), Go to "Settings --> Add-ons --> File Editor --> Configuration", turn off "Enforce Basepath" and restart the add-on
