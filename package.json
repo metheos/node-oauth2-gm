@@ -25,6 +25,6 @@
   "scripts": {
     "start": "node ./src/app.mjs",
     "build": "esbuild ./src/app.mjs --bundle --outfile=build/esbuild/app.js --platform=node --format=cjs && npx pkg --compress GZip --target latest-win-x64 -o build/GM-MS-TOKENS.exe ./build/esbuild/app.js",
-    "postinstall": "npx patchright install chromium"
+    "postinstall": "npx patchright install chromium && npx patchright install-deps chromium"
   }
 }
