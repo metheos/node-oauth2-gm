@@ -3,6 +3,7 @@ import * as readline from "node:readline/promises";
 import { exit, stdin as input, stdout as output } from "node:process";
 import fs from "fs";
 import path from "path";
+import os from "os"; // Added os import
 import axios from "axios";
 import { CookieJar } from "tough-cookie";
 import { HttpCookieAgent, HttpsCookieAgent } from "http-cookie-agent/http";
@@ -11,6 +12,7 @@ import { TOTP } from "totp-generator";
 import https from "https";
 import { custom } from "openid-client";
 import * as openidClient from "openid-client";
+import { chromium } from "patchright"; // Changed import
 
 // Set up readline interface
 const rl = readline.createInterface({ input, output });
@@ -27,12 +29,19 @@ class GMAuth {
   constructor(config) {
     this.config = config;
     this.config.tokenLocation = this.config.tokenLocation ?? "./";
-    this.MSTokenPath = path.join(this.config.tokenLocation, "microsoft_tokens.json");
+    this.MSTokenPath = path.join(
+      this.config.tokenLocation,
+      "microsoft_tokens.json"
+    );
     this.GMTokenPath = path.join(this.config.tokenLocation, "gm_tokens.json");
     this.oidc = {
       Issuer: openidClient.Issuer,
       generators: openidClient.generators,
     };
+    this.browser = null; // Added browser property
+    this.context = null; // Added context property
+    this.currentPage = null; // Added currentPage property
+    this.capturedAuthCode = null; // Added capturedAuthCode property
 
     const modernCiphers = [
       "TLS_AES_128_GCM_SHA256",
@@ -75,9 +84,98 @@ class GMAuth {
     this.csrfToken = null;
     this.transId = null;
     this.currentGMAPIToken = null;
-    this.debugMode = false;
-
+    this.debugMode = true;
     this.loadCurrentGMAPIToken();
+  }
+
+  // Helper function to wait for authorization code
+  async waitForAuthCode(timeoutMs = 10000, intervalMs = 500) {
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeoutMs) {
+      if (this.capturedAuthCode) {
+        if (this.debugMode)
+          console.log(
+            `[waitForAuthCode] Auth code captured: ${this.capturedAuthCode}`
+          );
+        return true;
+      }
+      if (this.debugMode)
+        console.log(
+          `[waitForAuthCode] Waiting for auth code... ${
+            (Date.now() - startTime) / 1000
+          }s elapsed`
+        );
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    if (this.debugMode)
+      console.log(
+        `[waitForAuthCode] Timeout waiting for auth code after ${
+          timeoutMs / 1000
+        }s`
+      );
+    return false;
+  }
+
+  // Browser management methods (copied from GMAuth.ts)
+  async initBrowser() {
+    if (this.browser) {
+      return; // Browser already initialized
+    }
+
+    const profilePath = path.join(os.tmpdir(), "gmauth-browser-profile");
+    if (fs.existsSync(profilePath)) {
+      fs.rmSync(profilePath, { recursive: true, force: true });
+      if (this.debugMode)
+        console.log(
+          "🗑️ Deleted existing temp browser profile at:",
+          profilePath
+        );
+    }
+    // Ensure the profile path parent directory exists, launchPersistentContext creates the final dir
+    fs.mkdirSync(path.dirname(profilePath), { recursive: true });
+
+    this.context = await chromium.launchPersistentContext(
+      profilePath, // Use user-specific temp directory
+      {
+        channel: "chrome",
+        headless: true, // Consider making this configurable via debugMode
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36",
+        viewport: { width: 1920, height: 1080 },
+        args: [
+          "--no-first-run",
+          "--disable-default-browser-check",
+          "--start-maximized",
+        ],
+      }
+    );
+
+    this.browser = this.context.browser();
+
+    await this.context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", {
+        get: () => undefined,
+      });
+    });
+
+    if (this.debugMode)
+      console.log(`🌐 Browser initialized with persistent context`);
+  }
+
+  async closeBrowser() {
+    if (this.currentPage) {
+      await this.currentPage.close();
+      this.currentPage = null;
+    }
+    if (this.context) {
+      await this.context.close();
+      this.context = null;
+    }
+    if (this.browser) {
+      await this.browser.close();
+      this.browser = null;
+    }
+    this.capturedAuthCode = null;
   }
 
   async authenticate() {
@@ -92,7 +190,9 @@ class GMAuth {
       await this.doFullAuthSequence();
       loadedTokenSet = await this.loadMSToken();
       if (!loadedTokenSet) {
-        throw new Error("Failed to load MS token set and could not generate a new one");
+        throw new Error(
+          "Failed to load MS token set and could not generate a new one"
+        );
       }
       return await this.getGMAPIToken(loadedTokenSet);
     } catch (error) {
@@ -106,25 +206,57 @@ class GMAuth {
   }
 
   async doFullAuthSequence() {
-    const { authorizationUrl, code_verifier } = await this.startMSAuthorizationFlow();
-    const authResponse = await this.getRequest(authorizationUrl);
-    this.csrfToken = this.getRegexMatch(authResponse.data, `\\"csrf\\":\\"(.*?)\\"`);
-    this.transId = this.getRegexMatch(authResponse.data, `\\"transId\\":\\"(.*?)\\"`);
+    try {
+      // Added try/finally block
+      this.capturedAuthCode = null; // Reset captured auth code
 
-    if (!this.csrfToken || !this.transId) {
-      throw new Error("Failed to extract csrf token or transId");
+      const { authorizationUrl, code_verifier } =
+        await this.startMSAuthorizationFlow();
+
+      await this.submitCredentials(authorizationUrl); // Pass authorizationUrl
+
+      // Attempt to wait for auth code if not immediately available from submitCredentials' CDP listener
+      if (!this.capturedAuthCode) {
+        if (this.debugMode) {
+          console.log(
+            "[doFullAuthSequence] Auth code not immediately set after submitCredentials. Waiting..."
+          );
+        }
+        await this.waitForAuthCode(10000); // Wait up to 10 seconds
+      }
+
+      // If code still not captured, try MFA (which also attempts to capture code)
+      if (!this.capturedAuthCode) {
+        if (this.debugMode)
+          console.log(
+            "[doFullAuthSequence] Auth code not captured after initial wait. Proceeding to handleMFA."
+          );
+        await this.handleMFA();
+      }
+
+      // One final check if MFA was called and might have set it, or if previous waits were on the edge
+      if (!this.capturedAuthCode) {
+        if (this.debugMode)
+          console.log(
+            "[doFullAuthSequence] Auth code still not captured after MFA attempt. Performing a final short wait."
+          );
+        await this.waitForAuthCode(5000); // Shorter final wait
+      }
+
+      const authCode = await this.getAuthorizationCode();
+      if (!authCode) {
+        throw new Error(
+          "Failed to get authorization code after all attempts. Possible incorrect credentials, MFA issue, or unexpected page flow."
+        );
+      }
+
+      const tokenSet = await this.getMSToken(authCode, code_verifier);
+      await this.saveTokens(tokenSet);
+      return tokenSet;
+    } finally {
+      // Added finally block
+      await this.closeBrowser(); // Ensure browser is closed
     }
-
-    await this.submitCredentials();
-    await this.handleMFA();
-    const authCode = await this.getAuthorizationCode();
-    if (!authCode) {
-      throw new Error("Failed to get authorization code. Bad TOTP Key?");
-    }
-
-    const tokenSet = await this.getMSToken(authCode, code_verifier);
-    await this.saveTokens(tokenSet);
-    return tokenSet;
   }
 
   async saveTokens(tokenSet) {
@@ -133,144 +265,509 @@ class GMAuth {
 
     if (this.currentGMAPIToken) {
       if (this.debugMode) console.log("Saving GM tokens to ", this.GMTokenPath);
-      fs.writeFileSync(this.GMTokenPath, JSON.stringify(this.currentGMAPIToken));
+      fs.writeFileSync(
+        this.GMTokenPath,
+        JSON.stringify(this.currentGMAPIToken)
+      );
     }
   }
 
   async getAuthorizationCode() {
+    // Return the authorization code captured during the browser flow
+    if (this.capturedAuthCode) {
+      if (this.debugMode)
+        console.log("Using authorization code captured from browser redirect");
+      return this.capturedAuthCode;
+    }
+
+    // Fallback to the original HTTP method if browser capture failed
+    if (this.debugMode)
+      console.log("Browser capture failed, trying fallback HTTP method");
     const authCodeRequestURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/api/SelfAsserted/confirmed?csrf_token=${this.csrfToken}&tx=${this.transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-    const authResponse = await this.captureRedirectLocation(authCodeRequestURL);
-    return this.getRegexMatch(authResponse, `code=(.*)`);
+    try {
+      const authResponse = await this.captureRedirectLocation(
+        authCodeRequestURL
+      );
+      return this.getRegexMatch(authResponse, `code=(.*)`);
+    } catch (error) {
+      console.error("Fallback HTTP method also failed:", error);
+      return null;
+    }
   }
 
   async handleMFA() {
-    if (this.debugMode) console.log("Loading MFA Page");
-    const mfaRequestURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/api/CombinedSigninAndSignup/confirmed?rememberMe=true&csrf_token=${this.csrfToken}&tx=${this.transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
+    if (this.debugMode) console.log("Handling MFA via browser automation");
 
-    const authResponse = await this.getRequest(mfaRequestURL);
-    this.csrfToken = this.getRegexMatch(authResponse.data, `\\"csrf\\":\\"(.*?)\\"`);
-    this.transId = this.getRegexMatch(authResponse.data, `\\"transId\\":\\"(.*?)\\"`);
-
-    if (!this.csrfToken || !this.transId) {
-      throw new Error("Failed to extract csrf token or transId during MFA");
+    if (!this.context || !this.currentPage) {
+      throw new Error(
+        "Browser context and page not initialized - call submitCredentials first"
+      );
     }
+    const page = this.currentPage;
 
-    var mfaType = null;
-    if (authResponse.data.includes("otpCode")) mfaType = "TOTP";
-    if (authResponse.data.includes("emailMfa")) mfaType = "EMAIL";
-    if (authResponse.data.includes("strongAuthenticationPhoneNumber")) mfaType = "SMS";
+    try {
+      await page.waitForLoadState("networkidle");
+      await page.waitForSelector(
+        'input[name="otpCode"], input[name="emailMfa"], input[name="strongAuthenticationPhoneNumber"]',
+        { timeout: 10000 }
+      );
 
-    if (this.debugMode) console.log("Determined MFA Type is", mfaType);
+      const pageContent = await page.content();
+      let mfaType = null;
+      if (
+        (await page.locator('input[name="otpCode"]').count()) > 0 ||
+        pageContent.includes("otpCode")
+      ) {
+        mfaType = "TOTP";
+      } else if (
+        (await page.locator('input[name="emailMfa"]').count()) > 0 ||
+        pageContent.includes("emailMfa")
+      ) {
+        mfaType = "EMAIL";
+      } else if (
+        (await page
+          .locator('input[name="strongAuthenticationPhoneNumber"]')
+          .count()) > 0 ||
+        pageContent.includes("strongAuthenticationPhoneNumber")
+      ) {
+        mfaType = "SMS";
+      }
 
-    if (mfaType == null) {
-      throw new Error("Could not determine MFA Type. Bad email or password?");
-    }
-    console.log("Determined MFA Type is", mfaType);
-    switch (mfaType) {
-      case "SMS":
+      if (this.debugMode) console.log("Determined MFA Type is", mfaType);
+      if (mfaType == null) {
+        throw new Error("Could not determine MFA Type. Bad email or password?");
+      }
+
+      if (mfaType === "SMS") {
         throw new Error("SMS is not implemented! Sorry!");
-        break;
-
-      case "TOTP":
-        //GENERATE AND SUBMIT TOTP CODE
+      } else if (mfaType === "TOTP") {
         var mfaCode = "";
-        if (user_totp_key && user_totp_key.trim() != "" && user_totp_key.length >= 16) {
+        if (
+          user_totp_key &&
+          user_totp_key.trim() != "" &&
+          user_totp_key.length >= 16
+        ) {
           var totp_secret = user_totp_key;
           if (user_totp_key.includes("secret=")) {
-            totp_secret = getRegexMatch(user_totp_key, "secret=(.*?)&");
+            totp_secret = this.getRegexMatch(user_totp_key, "secret=(.*?)&");
           }
-          const { otp, expires } = TOTP.generate(totp_secret, {
+          const { otp } = TOTP.generate(totp_secret, {
             digits: 6,
             algorithm: "SHA-1",
             period: 30,
           });
-          console.log("Generating and submitting OTP code:", otp);
+          if (this.debugMode)
+            console.log("Generating and submitting OTP code:", otp);
           mfaCode = otp;
         } else {
           mfaCode = await rl.question("Enter MFA Code from Authenticator App:");
         }
-        console.log("Submitting OTP Code:", mfaCode);
-        var postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${this.transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-        var MFACodeDataResp = {
-          otpCode: mfaCode,
-          request_type: "RESPONSE",
-        };
-        var MFACodeResponse = await this.postRequest(postMFACodeRespURL, MFACodeDataResp, this.csrfToken);
-        break;
+        if (this.debugMode) console.log("Submitting OTP Code:", mfaCode);
 
-      case "EMAIL":
-        // REQUEST EMAIL MFA CODE
-        console.log("Requesting MFA Code. Check your email!");
+        const otpField = await page
+          .locator(
+            'input[name=\\"otpCode\\"], [aria-label*=\\"One-Time Passcode\\"i], [aria-label*=\\"OTP\\"i]'
+          )
+          .first();
+        await otpField.fill(mfaCode);
+
+        const client = await page.context().newCDPSession(page);
+        await client.send("Network.enable");
+
+        client.on("Network.requestWillBeSent", (params) => {
+          const requestUrl = params.request.url;
+          if (this.debugMode) {
+            console.log(
+              `[DEBUG handleMFA CDP requestWillBeSent] Request to: ${requestUrl}`
+            );
+          }
+          if (
+            requestUrl
+              .toLowerCase()
+              .startsWith("msauth.com.gm.mychevrolet://auth")
+          ) {
+            if (this.debugMode)
+              console.log(
+                `[SUCCESS handleMFA CDP requestWillBeSent] Captured msauth redirect via CDP. URL: ${requestUrl}`
+              );
+            this.capturedAuthCode = this.getRegexMatch(
+              requestUrl,
+              `[?&]code=([^&]*)`
+            );
+            if (this.capturedAuthCode) {
+              if (this.debugMode)
+                console.log(
+                  `[SUCCESS handleMFA CDP requestWillBeSent] Extracted authorization code: ${this.capturedAuthCode}`
+                );
+            } else {
+              console.error(
+                `[ERROR handleMFA CDP requestWillBeSent] msauth redirect found, but FAILED to extract code from: ${requestUrl}`
+              );
+            }
+          }
+        });
+
+        client.on("Network.responseReceived", (params) => {
+          const response = params.response;
+          if (
+            (response.status === 301 || response.status === 302) &&
+            response.headers &&
+            response.headers.location
+          ) {
+            const location = response.headers.location;
+            if (this.debugMode) {
+              console.log(
+                `[DEBUG handleMFA CDP responseReceived] Redirect from ${response.url} to: ${location}`
+              );
+            }
+            if (
+              location
+                .toLowerCase()
+                .startsWith("msauth.com.gm.mychevrolet://auth")
+            ) {
+              if (this.debugMode)
+                console.log(
+                  `[SUCCESS handleMFA CDP responseReceived] Captured msauth redirect via CDP response. Location: ${location}`
+                );
+              this.capturedAuthCode = this.getRegexMatch(
+                location,
+                `[?&]code=([^&]*)`
+              );
+              if (this.capturedAuthCode) {
+                if (this.debugMode)
+                  console.log(
+                    `[SUCCESS handleMFA CDP responseReceived] Extracted authorization code: ${this.capturedAuthCode}`
+                  );
+              } else {
+                console.error(
+                  `[ERROR handleMFA CDP responseReceived] msauth redirect found, but FAILED to extract code from: ${location}`
+                );
+              }
+            }
+          }
+        });
+
+        const submitMfaButton = await page
+          .locator(
+            'button[type=\\"submit\\"], input[type=\\"submit\\"], button:has-text(\\"Verify\\"), button:has-text(\\"Continue\\"), button:has-text(\\"Submit\\"), [role=\\"button\\"][aria-label*=\\"Verify\\"i], [role=\\"button\\"][aria-label*=\\"Continue\\"i], [role=\\"button\\"][aria-label*=\\"Submit\\"i]'
+          )
+          .first();
+        await submitMfaButton.click();
+        // await page.waitForTimeout(3000); // Wait for redirect - Replaced by waitForAuthCode
+
+        try {
+          // Wait for the auth code to be captured by CDP listeners
+          if (this.debugMode)
+            console.log(
+              "[handleMFA TOTP] Waiting for auth code capture after submit..."
+            );
+          const captured = await this.waitForAuthCode(); // Use the new helper
+          if (!captured && this.debugMode) {
+            console.log(
+              "[handleMFA TOTP] Did not capture auth code after submit within timeout."
+            );
+          }
+        } catch (e) {
+          console.error("[handleMFA TOTP] Error during waitForAuthCode:", e);
+        }
+
+        try {
+          await client.detach();
+        } catch (e) {
+          // CDP session might already be detached
+        }
+        if (this.debugMode)
+          console.log("Waiting for redirect after MFA submission...");
+        await page.waitForLoadState("networkidle");
+
+        if (this.capturedAuthCode) {
+          if (this.debugMode)
+            console.log("Successfully captured authorization code");
+        } else {
+          if (this.debugMode)
+            console.log(
+              "Failed to capture authorization code from browser redirect"
+            );
+        }
+      } else if (mfaType === "EMAIL") {
+        if (this.debugMode)
+          console.log("Requesting MFA Code. Check your email!");
         const cpe2Url = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/SendCode?tx=${this.transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
         const cpe2Data = {
           emailMfa: user_email_addr,
         };
-        var cpe2Response = await this.postRequest(cpe2Url, cpe2Data, this.csrfToken);
+        await this.postRequest(cpe2Url, cpe2Data, this.csrfToken);
         var mfaCode = await rl.question("Enter MFA Code from Email Message:");
 
-        //submit MFA code
-        console.log("Submitting MFA Code.");
+        if (this.debugMode) console.log("Submitting MFA Code.");
         const postMFACodeURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl-RO/VerifyCode?tx=${this.transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-        // console.log(postMFACodeURL);
         const MFACodeData = {
           emailMfa: user_email_addr,
           verificationCode: mfaCode,
         };
-        var MFACodeResponse = await this.postRequest(postMFACodeURL, MFACodeData, this.csrfToken);
+        await this.postRequest(postMFACodeURL, MFACodeData, this.csrfToken);
 
-        //RESPONSE - not sure what this does, but we need to do it to move on
         var postMFACodeRespURL = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${this.transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-        // console.log(postMFACodeRespURL);
         var MFACodeDataResp = {
           emailMfa: user_email_addr,
           verificationCode: mfaCode,
           request_type: "RESPONSE",
         };
-        var MFACodeResponse = await this.postRequest(postMFACodeRespURL, MFACodeDataResp, this.csrfToken);
-        break;
-
-      default:
-        console.log("Could not determine MFA Type. Bad email or password?");
-        exit();
-        break;
+        await this.postRequest(
+          postMFACodeRespURL,
+          MFACodeDataResp,
+          this.csrfToken
+        );
+      }
+    } catch (error) {
+      console.error("Error in handleMFA:", error);
+      throw error;
     }
   }
 
-  async submitCredentials() {
-    if (this.debugMode) console.log("Sending GM login credentials");
-    const cpe1Url = `https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn/SelfAsserted?tx=${this.transId}&p=B2C_1A_SEAMLESS_MOBILE_SignUpOrSignIn`;
-    const cpe1Data = {
-      request_type: "RESPONSE",
-      logonIdentifier: this.config.username,
-      password: this.config.password,
-    };
-    await this.postRequest(cpe1Url, cpe1Data, this.csrfToken);
+  async submitCredentials(authorizationUrl) {
+    if (this.debugMode) console.log("Starting browser-based authentication");
+    await this.initBrowser();
+    if (!this.context) {
+      throw new Error("Browser context not initialized");
+    }
+
+    const page = await this.context.newPage();
+    this.currentPage = page;
+
+    const client = await page.context().newCDPSession(page);
+    await client.send("Network.enable");
+
+    client.on("Network.requestWillBeSent", (params) => {
+      const requestUrl = params.request.url;
+      if (this.debugMode) {
+        console.log(
+          `[DEBUG submitCredentials CDP requestWillBeSent] Request to: ${requestUrl}`
+        );
+      }
+      if (
+        requestUrl.toLowerCase().startsWith("msauth.com.gm.mychevrolet://auth")
+      ) {
+        if (this.debugMode)
+          console.log(
+            `[SUCCESS submitCredentials CDP requestWillBeSent] Captured msauth redirect via CDP. URL: ${requestUrl}`
+          );
+        this.capturedAuthCode = this.getRegexMatch(
+          requestUrl,
+          `[?&]code=([^&]*)`
+        );
+        if (this.capturedAuthCode) {
+          if (this.debugMode)
+            console.log(
+              `[SUCCESS submitCredentials CDP requestWillBeSent] Extracted authorization code: ${this.capturedAuthCode}`
+            );
+        } else {
+          console.error(
+            `[ERROR submitCredentials CDP requestWillBeSent] msauth redirect found, but FAILED to extract code from: ${requestUrl}`
+          );
+        }
+      }
+    });
+
+    client.on("Network.responseReceived", (params) => {
+      const response = params.response;
+      if (
+        (response.status === 301 || response.status === 302) &&
+        response.headers &&
+        response.headers.location
+      ) {
+        const location = response.headers.location;
+        if (this.debugMode) {
+          console.log(
+            `[DEBUG submitCredentials CDP responseReceived] Redirect from ${response.url} to: ${location}`
+          );
+        }
+
+        if (
+          location.toLowerCase().startsWith("msauth.com.gm.mychevrolet://auth")
+        ) {
+          if (this.debugMode)
+            console.log(
+              `[SUCCESS submitCredentials CDP responseReceived] Captured msauth redirect via CDP response. Location: ${location}`
+            );
+          this.capturedAuthCode = this.getRegexMatch(
+            location,
+            `[?&]code=([^&]*)`
+          );
+          if (this.capturedAuthCode) {
+            if (this.debugMode)
+              console.log(
+                `[SUCCESS submitCredentials CDP responseReceived] Extracted authorization code: ${this.capturedAuthCode}`
+              );
+          } else {
+            console.error(
+              `[ERROR submitCredentials CDP responseReceived] msauth redirect found, but FAILED to extract code from: ${location}`
+            );
+          }
+        }
+      }
+    });
+
+    try {
+      if (this.debugMode)
+        console.log(`Navigating to authorization URL: ${authorizationUrl}`);
+      await page.goto(authorizationUrl, { waitUntil: "networkidle" });
+      await page.waitForLoadState("networkidle");
+
+      if (this.debugMode) console.log("Attempting to fill username");
+      await page.fill('input[type="email"]', this.config.username);
+
+      if (this.debugMode)
+        console.log("Attempting to click next/submit after username");
+      const nextButtonSelectors = [
+        'button#continue[data-dtm="sign in"][aria-label="Continue"]',
+        'button:has-text("Continue")[data-dtm="sign in"]',
+        '[role="button"][aria-label*="Continue"i]',
+        'button#continue[data-dtm="sign in"][aria-label="Sign in"]',
+        'button:has-text("Log In")[data-dtm="sign in"]',
+        'button:has-text("Sign in")[data-dtm="sign in"]',
+        '[role="button"][aria-label*="Sign in"i]',
+        '[role="button"][aria-label*="Log In"i]',
+      ];
+      let clickedNext = false;
+      for (const selector of nextButtonSelectors) {
+        try {
+          await page.locator(selector).first().click({ timeout: 5000 });
+          if (this.debugMode)
+            console.log(`Clicked "${selector}" after username`);
+          clickedNext = true;
+          break;
+        } catch (e) {
+          // Selector not found or not clickable, try next
+        }
+      }
+      if (!clickedNext) {
+        console.warn(
+          "Could not find or click a 'Next' or 'Sign In' button after filling username."
+        );
+      }
+
+      await page.waitForLoadState("networkidle");
+
+      if (this.debugMode) console.log("Attempting to fill password");
+      await page.fill('input[type="password"]', this.config.password);
+
+      if (this.debugMode)
+        console.log("Attempting to click next/submit after password");
+      clickedNext = false;
+      for (const selector of nextButtonSelectors) {
+        try {
+          await page.locator(selector).first().click({ timeout: 5000 });
+          if (this.debugMode)
+            console.log(`Clicked "${selector}" after password`);
+          clickedNext = true;
+          break;
+        } catch (e) {
+          // Selector not found or not clickable, try next
+        }
+      }
+      if (!clickedNext) {
+        console.warn(
+          "Could not find or click a 'Next' or 'Sign In' button after filling password."
+        );
+      }
+
+      if (this.debugMode)
+        console.log("Waiting for navigation after credential submission...");
+      await page.waitForLoadState("networkidle", { timeout: 15000 });
+
+      if (this.capturedAuthCode) {
+        if (this.debugMode)
+          console.log("Authorization code captured during submitCredentials.");
+        return;
+      }
+
+      const urlAfterLogin = page.url();
+      if (this.debugMode)
+        console.log("URL after login attempt:", urlAfterLogin);
+
+      const isMfaPage = await page.isVisible(
+        'input[name="otpCode"], input[name="emailMfa"], input[name="strongAuthenticationPhoneNumber"]'
+      );
+      if (isMfaPage) {
+        if (this.debugMode)
+          console.log("MFA page detected after credential submission.");
+      } else if (!this.capturedAuthCode) {
+        console.warn(
+          "Did not capture auth code and not on a recognized MFA page after login. Current URL:",
+          urlAfterLogin
+        );
+      }
+    } catch (error) {
+      console.error("Error in submitCredentials:", error);
+      if (error.message && error.message.includes("Timeout")) {
+        console.error("Timeout occurred. Current page URL:", page.url());
+        const content = await page.content();
+        console.error("Page content:", content.substring(0, 500));
+      }
+      try {
+        if (client && !client.isClosed()) {
+          await client.detach();
+        }
+      } catch (detachError) {
+        console.warn(
+          "Error detaching CDP client in submitCredentials error handler:",
+          detachError
+        );
+      }
+      throw error;
+    }
+    try {
+      if (client && !client.isClosed()) {
+        await client.detach();
+      }
+    } catch (detachError) {
+      // console.warn("Error detaching CDP client at end of submitCredentials:", detachError);
+    }
   }
 
   static GMAuthTokenIsValid(authToken) {
-    return authToken && authToken.expires_at && authToken.expires_at > Date.now() / 1000 + 5 * 60;
+    return (
+      authToken &&
+      authToken.expires_at &&
+      authToken.expires_at > Date.now() / 1000 + 5 * 60
+    );
   }
 
   async loadCurrentGMAPIToken() {
-    if (this.debugMode) console.log("Loading existing GM API token, if it exists.");
+    if (this.debugMode)
+      console.log("Loading existing GM API token, if it exists.");
     if (fs.existsSync(this.GMTokenPath)) {
       try {
-        const storedToken = JSON.parse(fs.readFileSync(this.GMTokenPath, "utf-8"));
+        const storedToken = JSON.parse(
+          fs.readFileSync(this.GMTokenPath, "utf-8")
+        );
         const decodedPayload = jwt.decode(storedToken.access_token);
 
-        if (!decodedPayload || decodedPayload?.uid?.toUpperCase() !== this.config.username.toUpperCase()) {
-          if (this.debugMode) console.log("Stored GM API token was for different user, getting new token");
+        if (
+          !decodedPayload ||
+          decodedPayload?.uid?.toUpperCase() !==
+            this.config.username.toUpperCase()
+        ) {
+          if (this.debugMode)
+            console.log(
+              "Stored GM API token was for different user, getting new token"
+            );
         } else {
           const now = Math.floor(Date.now() / 1000);
           if (storedToken.expires_at && storedToken.expires_at > now + 5 * 60) {
             if (this.debugMode) console.log("Loaded existing GM API token");
             this.currentGMAPIToken = storedToken;
           } else {
-            if (this.debugMode) console.log("Existing GM API token has expired");
+            if (this.debugMode)
+              console.log("Existing GM API token has expired");
           }
         }
       } catch (err) {
-        console.warn("Stored GM API token was not parseable or invalid, getting new token:", err.message);
+        console.warn(
+          "Stored GM API token was not parseable or invalid, getting new token:",
+          err.message
+        );
       }
     } else {
       if (this.debugMode) console.log("No existing GM API token file found.");
@@ -279,12 +776,16 @@ class GMAuth {
 
   async getGMAPIToken(tokenSet) {
     const now = Math.floor(Date.now() / 1000);
-    if (this.currentGMAPIToken && this.currentGMAPIToken.expires_at > now + 5 * 60) {
+    if (
+      this.currentGMAPIToken &&
+      this.currentGMAPIToken.expires_at > now + 5 * 60
+    ) {
       if (this.debugMode) console.log("Returning existing valid GM API token");
       return this.currentGMAPIToken;
     }
 
-    if (this.debugMode) console.log("Requesting GM API Token using MS Access Token");
+    if (this.debugMode)
+      console.log("Requesting GM API Token using MS Access Token");
     const url = "https://na-mobile-api.gm.com/sec/authz/v3/oauth/token";
     try {
       const response = await this.axiosClient.post(
@@ -308,17 +809,29 @@ class GMAuth {
       const gmapiTokenResponse = response.data;
       const decodedPayload = jwt.decode(gmapiTokenResponse.access_token);
       if (!decodedPayload?.vehs) {
-        console.warn("Returned GM API token was missing vehicle information. Deleting existing tokens for reauth.");
-        if (fs.existsSync(this.MSTokenPath)) fs.renameSync(this.MSTokenPath, `${this.MSTokenPath}.old`);
-        if (fs.existsSync(this.GMTokenPath)) fs.renameSync(this.GMTokenPath, `${this.GMTokenPath}.old`);
+        console.warn(
+          "Returned GM API token was missing vehicle information. Deleting existing tokens for reauth."
+        );
+        if (fs.existsSync(this.MSTokenPath))
+          fs.renameSync(this.MSTokenPath, `${this.MSTokenPath}.old`);
+        if (fs.existsSync(this.GMTokenPath))
+          fs.renameSync(this.GMTokenPath, `${this.GMTokenPath}.old`);
         this.currentGMAPIToken = null;
         return await this.authenticate();
       }
 
-      gmapiTokenResponse.expires_at = Math.floor(Date.now() / 1000) + parseInt(gmapiTokenResponse.expires_in.toString());
-      gmapiTokenResponse.expires_in = parseInt(gmapiTokenResponse.expires_in.toString());
+      gmapiTokenResponse.expires_at =
+        Math.floor(Date.now() / 1000) +
+        parseInt(gmapiTokenResponse.expires_in.toString());
+      gmapiTokenResponse.expires_in = parseInt(
+        gmapiTokenResponse.expires_in.toString()
+      );
 
-      if (this.debugMode) console.log("Set GM Token expiration to ", gmapiTokenResponse.expires_at);
+      if (this.debugMode)
+        console.log(
+          "Set GM Token expiration to ",
+          gmapiTokenResponse.expires_at
+        );
 
       this.currentGMAPIToken = gmapiTokenResponse;
       await this.saveTokens(tokenSet);
@@ -336,9 +849,12 @@ class GMAuth {
         const parsedUrl = new URL(url);
         try {
           this.jar.setCookieSync(cookieString, parsedUrl.origin);
-          if (this.debugMode) console.log(`Added cookie: ${cookieString.split(";")[0]}`);
+          if (this.debugMode)
+            console.log(`Added cookie: ${cookieString.split(";")[0]}`);
         } catch (error) {
-          console.error(`Failed to add cookie: ${cookieString} for URL ${parsedUrl.origin}, Error: ${error.message}`);
+          console.error(
+            `Failed to add cookie: ${cookieString} for URL ${parsedUrl.origin}, Error: ${error.message}`
+          );
         }
       });
     }
@@ -355,7 +871,8 @@ class GMAuth {
         withCredentials: true,
         maxRedirects: 0,
         headers: {
-          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "Accept-Encoding": "gzip, deflate, br",
           "Accept-Language": "en-US,en;q=0.9",
           Connection: "keep-alive",
@@ -365,7 +882,8 @@ class GMAuth {
         },
       });
       this.processCookieHeaders(response, url);
-      if (this.debugMode) console.log("GET Response status:", response.status, "for URL:", url);
+      if (this.debugMode)
+        console.log("GET Response status:", response.status, "for URL:", url);
       return response;
     } catch (error) {
       if (error.response && error.response.status !== 302) {
@@ -373,7 +891,13 @@ class GMAuth {
       } else if (!error.response) {
         console.error("GET Request failed without response:", error.message);
       }
-      return error.response || { status: error.code, data: error.message, headers: {} };
+      return (
+        error.response || {
+          status: error.code,
+          data: error.message,
+          headers: {},
+        }
+      );
     }
   }
 
@@ -405,7 +929,8 @@ class GMAuth {
         },
       });
       this.processCookieHeaders(response, url);
-      if (this.debugMode) console.log("POST Response status:", response.status, "for URL:", url);
+      if (this.debugMode)
+        console.log("POST Response status:", response.status, "for URL:", url);
       return response;
     } catch (error) {
       this.handleRequestError(error, "POST Request Error");
@@ -416,10 +941,14 @@ class GMAuth {
 
   handleRequestError(error, context = "HTTP Error") {
     if (error.response) {
-      console.error(`${context} ${error.response.status}: ${error.response.statusText}`);
+      console.error(
+        `${context} ${error.response.status}: ${error.response.statusText}`
+      );
       console.error("Error details:", error.response.data);
       if (error.response.status === 401) {
-        console.error("Authentication failed. Please check your credentials or token validity.");
+        console.error(
+          "Authentication failed. Please check your credentials or token validity."
+        );
       }
     } else if (error.request) {
       console.error(`${context}: No response received from server`);
@@ -443,9 +972,11 @@ class GMAuth {
       }
       const response = await this.axiosClient.get(url, {
         maxRedirects: 0,
-        validateStatus: (status) => status === 302 || (status >= 200 && status < 300),
+        validateStatus: (status) =>
+          status === 302 || (status >= 200 && status < 300),
         headers: {
-          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "User-Agent":
             "Mozilla/5.0 (iPhone; CPU iPhone OS 15_8_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.6.6 Mobile/15E148 Safari/604.1",
           ...(cookieStringBefore && { Cookie: cookieStringBefore }),
@@ -457,20 +988,27 @@ class GMAuth {
       if (response.status === 302) {
         const redirectLocation = response.headers["location"];
         if (!redirectLocation) {
-          throw new Error("No redirect location found in response headers despite 302 status");
+          throw new Error(
+            "No redirect location found in response headers despite 302 status"
+          );
         }
         if (this.debugMode) console.log("Redirect location:", redirectLocation);
         return redirectLocation;
       }
-      throw new Error(`Expected a redirect (302) but got status: ${response.status}`);
+      throw new Error(
+        `Expected a redirect (302) but got status: ${response.status}`
+      );
     } catch (error) {
       if (error.response && error.response.status === 302) {
         this.processCookieHeaders(error.response, url);
         const redirectLocation = error.response.headers["location"];
         if (!redirectLocation) {
-          throw new Error("No redirect location found in response headers (error path)");
+          throw new Error(
+            "No redirect location found in response headers (error path)"
+          );
         }
-        if (this.debugMode) console.log("Redirect location (from error path):", redirectLocation);
+        if (this.debugMode)
+          console.log("Redirect location (from error path):", redirectLocation);
         return redirectLocation;
       }
       this.handleRequestError(error, "Redirect Capture Error");
@@ -480,13 +1018,21 @@ class GMAuth {
 
   async setupOpenIDClient() {
     const fallbackConfig = {
-      issuer: "https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/b2c_1a_seamless_mobile_signuporsignin/v2.0/",
-      authorization_endpoint: "https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/b2c_1a_seamless_mobile_signuporsignin/v2.0/authorize",
-      token_endpoint: "https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/b2c_1a_seamless_mobile_signuporsignin/v2.0/token",
-      jwks_uri: "https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/b2c_1a_seamless_mobile_signuporsignin/discovery/v2.0/keys",
+      issuer:
+        "https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/b2c_1a_seamless_mobile_signuporsignin/v2.0/",
+      authorization_endpoint:
+        "https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/b2c_1a_seamless_mobile_signuporsignin/v2.0/authorize",
+      token_endpoint:
+        "https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/b2c_1a_seamless_mobile_signuporsignin/v2.0/token",
+      jwks_uri:
+        "https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/b2c_1a_seamless_mobile_signuporsignin/discovery/v2.0/keys",
       response_types_supported: ["code", "id_token", "code id_token"],
       response_modes_supported: ["query", "fragment", "form_post"],
-      grant_types_supported: ["authorization_code", "implicit", "refresh_token"],
+      grant_types_supported: [
+        "authorization_code",
+        "implicit",
+        "refresh_token",
+      ],
       subject_types_supported: ["pairwise"],
       id_token_signing_alg_values_supported: ["RS256"],
       scopes_supported: ["openid"],
@@ -495,7 +1041,8 @@ class GMAuth {
     try {
       const discoveryUrl =
         "https://custlogin.gm.com/gmb2cprod.onmicrosoft.com/b2c_1a_seamless_mobile_signuporsignin/v2.0/.well-known/openid-configuration";
-      if (this.debugMode) console.log("Attempting OpenID discovery from:", discoveryUrl);
+      if (this.debugMode)
+        console.log("Attempting OpenID discovery from:", discoveryUrl);
 
       const response = await axios.get(discoveryUrl, {
         headers: {
@@ -509,18 +1056,27 @@ class GMAuth {
       issuerInstance = new this.oidc.Issuer({
         ...fallbackConfig,
         ...discoveredConfig,
-        authorization_endpoint: discoveredConfig.authorization_endpoint || fallbackConfig.authorization_endpoint,
-        token_endpoint: discoveredConfig.token_endpoint || fallbackConfig.token_endpoint,
+        authorization_endpoint:
+          discoveredConfig.authorization_endpoint ||
+          fallbackConfig.authorization_endpoint,
+        token_endpoint:
+          discoveredConfig.token_endpoint || fallbackConfig.token_endpoint,
         jwks_uri: discoveredConfig.jwks_uri || fallbackConfig.jwks_uri,
       });
-      if (this.debugMode) console.log("Successfully created issuer with discovery data");
+      if (this.debugMode)
+        console.log("Successfully created issuer with discovery data");
     } catch (error) {
-      console.warn("OpenID discovery failed, using fallback configuration", error.message);
+      console.warn(
+        "OpenID discovery failed, using fallback configuration",
+        error.message
+      );
       issuerInstance = new this.oidc.Issuer(fallbackConfig);
-      if (this.debugMode) console.log("Created issuer with fallback configuration");
+      if (this.debugMode)
+        console.log("Created issuer with fallback configuration");
     }
     if (!issuerInstance) throw new Error("Failed to create OpenID issuer");
-    if (!issuerInstance.authorization_endpoint) throw new Error("Issuer missing authorization_endpoint");
+    if (!issuerInstance.authorization_endpoint)
+      throw new Error("Issuer missing authorization_endpoint");
 
     const client = new issuerInstance.Client({
       client_id: "3ff30506-d242-4bed-835b-422bf992622e",
@@ -539,13 +1095,15 @@ class GMAuth {
     const code_challenge = this.oidc.generators.codeChallenge(code_verifier);
     const state = this.oidc.generators.nonce();
     const authorizationUrl = client.authorizationUrl({
-      scope: "https://gmb2cprod.onmicrosoft.com/3ff30506-d242-4bed-835b-422bf992622e/Test.Read openid profile offline_access",
+      scope:
+        "https://gmb2cprod.onmicrosoft.com/3ff30506-d242-4bed-835b-422bf992622e/Test.Read openid profile offline_access",
       code_challenge,
       code_challenge_method: "S256",
       bundleID: "com.gm.myChevrolet",
       client_id: "3ff30506-d242-4bed-835b-422bf992622e",
       mode: "dark",
-      evar25: "mobile_mychevrolet_chevrolet_us_app_launcher_sign_in_or_create_account",
+      evar25:
+        "mobile_mychevrolet_chevrolet_us_app_launcher_sign_in_or_create_account",
       channel: "lightreg",
       ui_locales: "en-US",
       brand: "chevrolet",
@@ -557,8 +1115,13 @@ class GMAuth {
   async getMSToken(code, code_verifier) {
     const client = await this.setupOpenIDClient();
     try {
-      const openIdTokenSet = await client.callback("msauth.com.gm.myChevrolet://auth", { code }, { code_verifier, response_type: "code" });
-      if (!openIdTokenSet.access_token) throw new Error("No access token received");
+      const openIdTokenSet = await client.callback(
+        "msauth.com.gm.myChevrolet://auth",
+        { code },
+        { code_verifier, response_type: "code" }
+      );
+      if (!openIdTokenSet.access_token)
+        throw new Error("No access token received");
 
       const tokenSet = {
         access_token: openIdTokenSet.access_token,
@@ -576,27 +1139,40 @@ class GMAuth {
   }
 
   async loadMSToken() {
-    if (this.debugMode) console.log("Loading existing MS tokens, if they exist.");
+    if (this.debugMode)
+      console.log("Loading existing MS tokens, if they exist.");
     if (fs.existsSync(this.MSTokenPath)) {
       let storedTokens = null;
       try {
         storedTokens = JSON.parse(fs.readFileSync(this.MSTokenPath, "utf-8"));
       } catch (err) {
-        console.warn("Stored MS token was not parseable, getting new token:", err.message);
+        console.warn(
+          "Stored MS token was not parseable, getting new token:",
+          err.message
+        );
         return false;
       }
 
       try {
         const decodedPayload = jwt.decode(storedTokens.access_token);
         const usernameUpper = this.config.username.toUpperCase();
-        const tokenUserIdentifier = decodedPayload?.name?.toUpperCase() || decodedPayload?.email?.toUpperCase() || decodedPayload?.upn?.toUpperCase();
+        const tokenUserIdentifier =
+          decodedPayload?.name?.toUpperCase() ||
+          decodedPayload?.email?.toUpperCase() ||
+          decodedPayload?.upn?.toUpperCase();
 
         if (!decodedPayload || tokenUserIdentifier !== usernameUpper) {
-          if (this.debugMode) console.log(`Stored MS token was for different user (${tokenUserIdentifier} vs ${usernameUpper}), getting new token`);
+          if (this.debugMode)
+            console.log(
+              `Stored MS token was for different user (${tokenUserIdentifier} vs ${usernameUpper}), getting new token`
+            );
           return false;
         }
       } catch (jwtError) {
-        console.warn("Error decoding stored MS token, getting new token:", jwtError.message);
+        console.warn(
+          "Error decoding stored MS token, getting new token:",
+          jwtError.message
+        );
         return false;
       }
 
@@ -608,13 +1184,17 @@ class GMAuth {
         if (this.debugMode) console.log("Refreshing MS access token");
         try {
           const client = await this.setupOpenIDClient();
-          const refreshedTokens = await client.refresh(storedTokens.refresh_token);
-          if (!refreshedTokens.access_token) throw new Error("Refresh token response missing access_token");
+          const refreshedTokens = await client.refresh(
+            storedTokens.refresh_token
+          );
+          if (!refreshedTokens.access_token)
+            throw new Error("Refresh token response missing access_token");
 
           const tokenSet = {
             access_token: refreshedTokens.access_token,
             id_token: refreshedTokens.id_token,
-            refresh_token: refreshedTokens.refresh_token || storedTokens.refresh_token,
+            refresh_token:
+              refreshedTokens.refresh_token || storedTokens.refresh_token,
             expires_at: refreshedTokens.expires_at,
             expires_in: refreshedTokens.expires_in,
           };
@@ -622,11 +1202,13 @@ class GMAuth {
           return tokenSet;
         } catch (refreshError) {
           console.error("Failed to refresh MS token:", refreshError.message);
-          if (refreshError.data) console.error("Refresh error data:", refreshError.data);
+          if (refreshError.data)
+            console.error("Refresh error data:", refreshError.data);
           return false;
         }
       } else {
-        if (this.debugMode) console.log("MS Token expired and no refresh token available.");
+        if (this.debugMode)
+          console.log("MS Token expired and no refresh token available.");
         return false;
       }
     }
@@ -637,14 +1219,28 @@ class GMAuth {
 // Wrap the main logic in an async function
 async function main() {
   dotenv.config();
-  user_email_addr = process.env.EMAIL ?? (await rl.question("Enter OnStar account email address:"));
-  user_password = process.env.PASSWORD ?? (await rl.question("Enter OnStar account password:"));
-  user_device_uuid = process.env.UUID ?? (await rl.question("Enter Device ID (UUID):"));
-  user_vehicle_vin = process.env.VIN ?? (await rl.question("Enter Vehicle VIN:"));
-  user_totp_key = process.env.TOTPKEY ?? (await rl.question("Enter TOTP Key/Secret:"));
+  user_email_addr =
+    process.env.EMAIL ??
+    (await rl.question("Enter OnStar account email address:"));
+  user_password =
+    process.env.PASSWORD ??
+    (await rl.question("Enter OnStar account password:"));
+  user_device_uuid =
+    process.env.UUID ?? (await rl.question("Enter Device ID (UUID):"));
+  user_vehicle_vin =
+    process.env.VIN ?? (await rl.question("Enter Vehicle VIN:"));
+  user_totp_key =
+    process.env.TOTPKEY ?? (await rl.question("Enter TOTP Key/Secret:"));
 
-  if (!user_email_addr || !user_password || !user_device_uuid || !user_totp_key) {
-    console.log("Onstar Account Information (Email, Password, Device ID, TOTP Key) must be provided.");
+  if (
+    !user_email_addr ||
+    !user_password ||
+    !user_device_uuid ||
+    !user_totp_key
+  ) {
+    console.log(
+      "Onstar Account Information (Email, Password, Device ID, TOTP Key) must be provided."
+    );
     exit();
   }
 
@@ -663,13 +1259,23 @@ async function main() {
 
     if (gmapiTokenResponse && gmapiTokenResponse.access_token) {
       console.log("GM Authentication successful. GM API Token obtained.");
-      console.log("GM API Access Token (first 10 chars):", gmapiTokenResponse.access_token.substring(0, 10) + "...");
-      console.log("GM API Token Expires At:", new Date(gmapiTokenResponse.expires_at * 1000));
+      console.log(
+        "GM API Access Token (first 10 chars):",
+        gmapiTokenResponse.access_token.substring(0, 10) + "..."
+      );
+      console.log(
+        "GM API Token Expires At:",
+        new Date(gmapiTokenResponse.expires_at * 1000)
+      );
 
       if (user_vehicle_vin) {
         try {
           console.log(`Testing GM API Request for VIN: ${user_vehicle_vin}`);
-          await testGMAPIRequestUsingAxios(gmapiTokenResponse, user_vehicle_vin, gmAuth.axiosClient);
+          await testGMAPIRequestUsingAxios(
+            gmapiTokenResponse,
+            user_vehicle_vin,
+            gmAuth.axiosClient
+          );
         } catch (error) {
           console.error("GM API Test failed:", error.message);
         }
@@ -680,14 +1286,21 @@ async function main() {
       console.error("GM Authentication failed to return a valid token.");
     }
   } catch (error) {
-    console.error("Overall authentication or API test process failed:", error.message);
+    console.error(
+      "Overall authentication or API test process failed:",
+      error.message
+    );
     if (error.stack) console.error(error.stack);
   }
   exit();
 }
 
 // Test the GM API using the GM API token (rewritten for Axios)
-async function testGMAPIRequestUsingAxios(gmapiTokenResponse, vin, axiosInstance) {
+async function testGMAPIRequestUsingAxios(
+  gmapiTokenResponse,
+  vin,
+  axiosInstance
+) {
   console.log("Testing GM API Request with Axios");
   try {
     const postData = {
@@ -725,22 +1338,31 @@ async function testGMAPIRequestUsingAxios(gmapiTokenResponse, vin, axiosInstance
 
     const clientToUse = axiosInstance || axios;
 
-    const response = await clientToUse.post(`https://na-mobile-api.gm.com/api/v1/account/vehicles/${vin}/commands/diagnostics`, postData, {
-      headers: {
-        Authorization: `Bearer ${gmapiTokenResponse.access_token}`,
-        "Content-Type": "application/json; charset=UTF-8",
-        Accept: "application/json",
-      },
-    });
+    const response = await clientToUse.post(
+      `https://na-mobile-api.gm.com/api/v1/account/vehicles/${vin}/commands/diagnostics`,
+      postData,
+      {
+        headers: {
+          Authorization: `Bearer ${gmapiTokenResponse.access_token}`,
+          "Content-Type": "application/json; charset=UTF-8",
+          Accept: "application/json",
+        },
+      }
+    );
 
     console.log("Diagnostic request successful:", response.data);
     return response.data;
   } catch (error) {
     if (error.response) {
       console.error(`GM API Request Error ${error.response.status}`);
-      console.error("Error details:", error.response.data || error.response.statusText);
+      console.error(
+        "Error details:",
+        error.response.data || error.response.statusText
+      );
       if (error.response.status === 401) {
-        console.error("Authentication failed for API request. Token may be invalid or expired.");
+        console.error(
+          "Authentication failed for API request. Token may be invalid or expired."
+        );
       }
     } else if (error.request) {
       console.error("No response received from GM API for diagnostic request");
