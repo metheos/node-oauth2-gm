@@ -12,10 +12,109 @@ import { TOTP } from "totp-generator";
 import https from "https";
 import { custom } from "openid-client";
 import * as openidClient from "openid-client";
-import { chromium } from "patchright"; // Changed import
+import unzipper from "unzipper";
+// Dynamically import patchright after env is set
+let chromium;
 
 // Set up readline interface
 const rl = readline.createInterface({ input, output });
+
+// --- Chromium/FFMPEG auto-download logic ---
+async function ensureChromiumAndFFMPEG() {
+  const baseDir = path.resolve(path.dirname(process.execPath), "ms-playwright");
+  const chromiumDir = path.join(baseDir, "chromium-1169");
+  const ffmpegDir = path.join(baseDir, "ffmpeg-1011");
+  const headlessDir = path.join(baseDir, "chromium_headless_shell-1169");
+  const winlddDir = path.join(baseDir, "winldd-1007");
+  const browsersJsonPath = path.join(baseDir, "browsers.json");
+
+  const downloads = [
+    {
+      name: "Chromium",
+      dir: chromiumDir,
+      url: "https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/1169/chromium-win64.zip",
+    },
+    {
+      name: "FFMPEG",
+      dir: ffmpegDir,
+      url: "https://cdn.playwright.dev/dbazure/download/playwright/builds/ffmpeg/1011/ffmpeg-win64.zip",
+    },
+    {
+      name: "Chromium Headless Shell",
+      dir: headlessDir,
+      url: "https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/1169/chromium-headless-shell-win64.zip",
+    },
+    {
+      name: "WinLDD",
+      dir: winlddDir,
+      url: "https://cdn.playwright.dev/dbazure/download/playwright/builds/winldd/1007/winldd-win64.zip",
+    },
+  ];
+
+  for (const d of downloads) {
+    if (!fs.existsSync(d.dir)) {
+      console.log(`⬇️ Downloading ${d.name}...`);
+      const zipPath = path.join(baseDir, `${d.name.replace(/ /g, "_")}.zip`);
+      fs.mkdirSync(path.dirname(zipPath), { recursive: true });
+      await downloadFile(d.url, zipPath);
+      fs.mkdirSync(path.dirname(d.dir), { recursive: true });
+      await extractZip(zipPath, d.dir);
+      fs.unlinkSync(zipPath);
+      console.log(`📁 ${d.name} downloaded and extracted.`);
+    }
+  }
+  // Always ensure browsers.json exists for Playwright/Patchright
+  const browsersJson = {
+    chromium: {
+      revision: "1169",
+      executablePath: path.join(chromiumDir, "chrome-win", "chrome.exe"),
+      downloadUrl: "https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/1169/chromium-win64.zip",
+    },
+  };
+  fs.writeFileSync(browsersJsonPath, JSON.stringify(browsersJson, null, 2));
+  console.log("📝 Created/updated browsers.json");
+
+  // Debug: check what's actually in the chromium directory
+  try {
+    const chromiumContents = fs.readdirSync(chromiumDir);
+    console.log("[DEBUG] chromium-1169 directory contents:", chromiumContents.slice(0, 10)); // Show first 10 items
+
+    // Look for chrome.exe or chromium.exe
+    const exeFiles = chromiumContents.filter((f) => f.endsWith(".exe"));
+    console.log("[DEBUG] .exe files in chromium-1169:", exeFiles);
+
+    // Check browsers.json content
+    const browsersJsonContent = fs.readFileSync(browsersJsonPath, "utf8");
+    console.log("[DEBUG] browsers.json content:", browsersJsonContent);
+  } catch (e) {
+    console.log("[DEBUG] Error reading chromium directory:", e.message);
+  }
+}
+
+async function downloadFile(url, dest) {
+  const writer = fs.createWriteStream(dest);
+  const response = await axios({ url, method: "GET", responseType: "stream" });
+  await new Promise((resolve, reject) => {
+    response.data.pipe(writer);
+    let error = null;
+    writer.on("error", (err) => {
+      error = err;
+      writer.close();
+      reject(err);
+    });
+    writer.on("close", () => {
+      if (!error) resolve();
+    });
+  });
+}
+
+async function extractZip(zipPath, outDir) {
+  await fs
+    .createReadStream(zipPath)
+    .pipe(unzipper.Extract({ path: outDir }))
+    .promise();
+}
+// --- end auto-download logic ---
 
 // Define variables
 var user_email_addr = null;
@@ -424,7 +523,17 @@ class GMAuth {
 
   async submitCredentials(authorizationUrl) {
     if (this.debugMode) console.log("✅ Starting browser-based authentication");
-    await this.initBrowser();
+    try {
+      await this.initBrowser();
+    } catch (error) {
+      console.log("🫥 Chromium not found. Downloading");
+      try {
+        await ensureChromiumAndFFMPEG();
+        await this.initBrowser();
+      } catch (err) {
+        throw new Error(`🚫 Failed to download and initialize Chromium: ${err.message}`);
+      }
+    }
     if (!this.context) {
       throw new Error("🚫 Browser context not initialized");
     }
@@ -969,8 +1078,20 @@ class GMAuth {
 
 // Wrap the main logic in an async function
 async function main() {
+  // Set env variable
+  const msPlaywrightPath = path.resolve(path.dirname(process.execPath), "ms-playwright");
+  process.env.PLAYWRIGHT_BROWSERS_PATH = msPlaywrightPath;
+  console.log("[DEBUG] PLAYWRIGHT_BROWSERS_PATH:", msPlaywrightPath);
+  try {
+    const contents = fs.readdirSync(msPlaywrightPath);
+    console.log("[DEBUG] ms-playwright directory contents:", contents);
+  } catch (e) {
+    console.log("[DEBUG] ms-playwright directory not found:", msPlaywrightPath);
+  } // Dynamic import
+  ({ chromium } = await import("patchright"));
+
   dotenv.config();
-  user_email_addr = process.env.EMAIL ?? (await rl.question("✉️ Enter OnStar account email address:"));
+  user_email_addr = process.env.EMAIL ?? (await rl.question("📨 Enter OnStar account email address:"));
   user_password = process.env.PASSWORD ?? (await rl.question("🔑 Enter OnStar account password:"));
   user_vehicle_vin = process.env.VIN ?? (await rl.question("🚗 Enter Vehicle VIN (Optional, but testing will be skipped!):"));
   user_totp_key = process.env.TOTPKEY ?? (await rl.question("🔐 Enter TOTP Key/Secret (optional):"));
@@ -1027,6 +1148,8 @@ async function main() {
     console.error("🚫 Overall authentication or API test process failed:", error.message);
     if (error.stack) console.error(error.stack);
   }
+  // Wait for user to press Enter before exiting
+  await rl.question("Press Enter to exit...");
   exit();
 }
 

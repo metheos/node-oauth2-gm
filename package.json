@@ -12,19 +12,28 @@
     "superagent": "^10.1.1",
     "totp-generator": "^1.0.0",
     "tough-cookie": "^5.1.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "unzipper": "^0.12.3"
   },
   "devDependencies": {
     "@babel/cli": "^7.25.9",
     "@babel/core": "^7.26.0",
     "@babel/plugin-transform-modules-commonjs": "^7.25.9",
     "@yao-pkg/pkg": "^6.1.1",
+    "cpx": "^1.5.0",
     "esbuild": "^0.24.0",
-    "ncc": "^0.3.6"
+    "ncc": "^0.3.6",
+    "pkg": "^5.8.1"
   },
   "scripts": {
     "start": "node ./src/app.mjs",
-    "build": "esbuild ./src/app.mjs --bundle --outfile=build/esbuild/app.js --platform=node --format=cjs && npx pkg --compress GZip --target latest-win-x64 -o build/GM-MS-TOKENS.exe ./build/esbuild/app.js",
-    "postinstall": "npx patchright install chromium && npx patchright install-deps chromium"
+    "build": "esbuild ./src/app.mjs --bundle --outfile=build/esbuild/app.js --platform=node --format=cjs --external:patchright-core --external:chromium-bidi --external:@aws-sdk/client-s3 && npx pkg --compress GZip --target latest-win-x64 -o build/GM-MS-TOKENS.exe ./build/esbuild/app.js",
+    "package-sfx": "\"C:\\Program Files\\7-Zip\\7z.exe\" a -mx=9 -m0=lzma -mmt=on -sfx\"C:\\Program Files\\7-Zip\\7z.sfx\" build/GM-MS-TOKENS-SFX.exe ./build/GM-MS-TOKENS.exe ./build/ms-playwright"
+  },
+  "pkg": {
+    "assets": [
+      "node_modules/patchright-core/package.json",
+      "node_modules/patchright-core/lib/server/chromium/appIcon.png"
+    ]
   }
 }
