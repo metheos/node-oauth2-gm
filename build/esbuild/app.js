@@ -43411,6 +43411,7 @@ var GMAuth = class {
       const decodedPayload = import_jsonwebtoken.default.decode(gmapiTokenResponse.access_token);
       if (!decodedPayload?.vehs) {
         console.warn("\u{1F6AB} Returned GM API token was missing vehicle information. Please check if you used the right GM account or try again later.");
+        await rl.question("Press Enter to exit...");
         (0, import_node_process.exit)(1);
       }
       gmapiTokenResponse.expires_at = Math.floor(Date.now() / 1e3) + parseInt(gmapiTokenResponse.expires_in.toString());
@@ -43673,12 +43674,9 @@ var GMAuth = class {
 async function main() {
   const msPlaywrightPath = import_path.default.resolve(import_path.default.dirname(process.execPath), "ms-playwright");
   process.env.PLAYWRIGHT_BROWSERS_PATH = msPlaywrightPath;
-  console.log("[DEBUG] PLAYWRIGHT_BROWSERS_PATH:", msPlaywrightPath);
   try {
     const contents = import_fs.default.readdirSync(msPlaywrightPath);
-    console.log("[DEBUG] ms-playwright directory contents:", contents);
   } catch (e2) {
-    console.log("[DEBUG] ms-playwright directory not found:", msPlaywrightPath);
   }
   ({ chromium } = await Promise.resolve().then(() => (init_patchright(), patchright_exports)));
   import_dotenv.default.config();

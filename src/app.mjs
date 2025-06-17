@@ -791,6 +791,7 @@ class GMAuth {
         // this.currentGMAPIToken = null;
         // return await this.authenticate();
         // quit the program
+        await rl.question("Press Enter to exit...");
         exit(1);
       }
 
@@ -1081,12 +1082,12 @@ async function main() {
   // Set env variable
   const msPlaywrightPath = path.resolve(path.dirname(process.execPath), "ms-playwright");
   process.env.PLAYWRIGHT_BROWSERS_PATH = msPlaywrightPath;
-  console.log("[DEBUG] PLAYWRIGHT_BROWSERS_PATH:", msPlaywrightPath);
+  // console.log("[DEBUG] PLAYWRIGHT_BROWSERS_PATH:", msPlaywrightPath);
   try {
     const contents = fs.readdirSync(msPlaywrightPath);
-    console.log("[DEBUG] ms-playwright directory contents:", contents);
+    // console.log("[DEBUG] ms-playwright directory contents:", contents);
   } catch (e) {
-    console.log("[DEBUG] ms-playwright directory not found:", msPlaywrightPath);
+    // console.log("[DEBUG] ms-playwright directory not found:", msPlaywrightPath);
   } // Dynamic import
   ({ chromium } = await import("patchright"));
 
