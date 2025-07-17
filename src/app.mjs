@@ -219,13 +219,30 @@ class GMAuth {
       profilePath, // Use user-specific temp directory
       {
         channel: "chromium", // Use chromium
-        headless: true,
+        headless: false,
         hasTouch: true, // Simulate touch support
         isMobile: true, // Simulate mobile device
         userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36",
         //simulate iphone 16 resolution
         viewport: { width: 430, height: 932 }, // iPhone 16 resolution
-        args: ["--disable-blink-features=AutomationControlled", "--no-first-run", "--disable-default-browser-check"],
+        args: [
+          "--disable-blink-features=AutomationControlled",
+          "--no-first-run",
+          "--disable-default-browser-check",
+          "--disable-password-generation",
+          "--disable-save-password-bubble",
+          "--disable-password-manager-reauthentication",
+          "--password-store=basic",
+          "--disable-features=PasswordManager",
+          "--disable-features=VizDisplayCompositor",
+          "--disable-password-manager",
+          "--disable-save-password",
+          "--window-position=-2000,-2000", // Start far off-screen
+          "--window-size=100,100", // Very small window size
+          "--start-minimized", // Try to start minimized
+          "--disable-background-timer-throttling", // Prevent throttling
+          "--disable-backgrounding-occluded-windows", // Prevent backgrounding
+        ],
       }
     );
 
@@ -282,47 +299,87 @@ class GMAuth {
   }
 
   async doFullAuthSequence() {
-    try {
-      // Added try/finally block
-      this.capturedAuthCode = null; // Reset captured auth code
+    const maxRetries = 2;
+    let lastError = null;
 
-      const { authorizationUrl, code_verifier } = await this.startMSAuthorizationFlow();
-
-      await this.submitCredentials(authorizationUrl); // Pass authorizationUrl
-
-      // Attempt to wait for auth code if not immediately available from submitCredentials' CDP listener
-      if (!this.capturedAuthCode) {
-        if (this.debugMode) {
-          console.log("⌛ [doFullAuthSequence] Auth code not immediately set after submitCredentials. Waiting...");
+    for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+      try {
+        if (this.debugMode && attempt > 1) {
+          console.log(`🔄 [doFullAuthSequence] Retry attempt ${attempt - 1}/${maxRetries}`);
         }
-        await this.waitForAuthCode(10000); // Wait up to 10 seconds
-      }
 
-      // If code still not captured, try MFA (which also attempts to capture code)
-      if (!this.capturedAuthCode) {
-        if (this.debugMode) console.log("🕵️ [doFullAuthSequence] Auth code not captured after initial wait. Proceeding to handleMFA.");
-        await this.handleMFA();
-      }
+        // Reset captured auth code for each attempt
+        this.capturedAuthCode = null;
 
-      // One final check if MFA was called and might have set it, or if previous waits were on the edge
-      if (!this.capturedAuthCode) {
-        if (this.debugMode) console.log("⌛ [doFullAuthSequence] Auth code still not captured after MFA attempt. Performing a final short wait.");
-        await this.waitForAuthCode(5000); // Shorter final wait
-      }
+        const { authorizationUrl, code_verifier } = await this.startMSAuthorizationFlow();
 
-      const authCode = await this.getAuthorizationCode();
-      if (!authCode) {
-        throw new Error(
-          "🚫 Failed to get authorization code after all attempts. Possible incorrect credentials, MFA issue, or unexpected page flow."
-        );
-      }
+        await this.submitCredentials(authorizationUrl); // Pass authorizationUrl
 
-      const tokenSet = await this.getMSToken(authCode, code_verifier);
-      await this.saveTokens(tokenSet);
-      return tokenSet;
-    } finally {
-      // Added finally block
-      await this.closeBrowser(); // Ensure browser is closed
+        // Attempt to wait for auth code if not immediately available from submitCredentials' CDP listener
+        if (!this.capturedAuthCode) {
+          if (this.debugMode) {
+            console.log("⌛ [doFullAuthSequence] Auth code not immediately set after submitCredentials. Waiting...");
+          }
+          await this.waitForAuthCode(10000); // Wait up to 10 seconds
+        }
+
+        // If code still not captured, try MFA (which also attempts to capture code)
+        if (!this.capturedAuthCode) {
+          if (this.debugMode) console.log("🕵️ [doFullAuthSequence] Auth code not captured after initial wait. Proceeding to handleMFA.");
+          await this.handleMFA();
+        }
+
+        // One final check if MFA was called and might have set it, or if previous waits were on the edge
+        if (!this.capturedAuthCode) {
+          if (this.debugMode) console.log("⌛ [doFullAuthSequence] Auth code still not captured after MFA attempt. Performing a final short wait.");
+          await this.waitForAuthCode(5000); // Shorter final wait
+        }
+
+        const authCode = await this.getAuthorizationCode();
+        if (!authCode) {
+          throw new Error(
+            "🚫 Failed to get authorization code after all attempts. Possible incorrect credentials, MFA issue, or unexpected page flow."
+          );
+        }
+
+        const tokenSet = await this.getMSToken(authCode, code_verifier);
+        await this.saveTokens(tokenSet);
+
+        if (this.debugMode && attempt > 1) {
+          console.log(`✅ [doFullAuthSequence] Authentication succeeded on attempt ${attempt}`);
+        }
+
+        return tokenSet;
+      } catch (error) {
+        lastError = error;
+
+        // Always close browser after each attempt (success or failure)
+        try {
+          await this.closeBrowser();
+        } catch (closeError) {
+          if (this.debugMode) console.log("⚠️ Error closing browser:", closeError.message);
+        }
+
+        if (attempt <= maxRetries) {
+          if (this.debugMode) {
+            console.log(`🚫 [doFullAuthSequence] Attempt ${attempt} failed: ${error.message}`);
+            console.log(`⏳ [doFullAuthSequence] Waiting 2 seconds before retry...`);
+          }
+          await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait 2 seconds before retry
+        } else {
+          if (this.debugMode) {
+            console.log(`🚫 [doFullAuthSequence] All ${maxRetries + 1} attempts failed. Giving up.`);
+          }
+          throw lastError;
+        }
+      }
+    }
+
+    // Always close browser after each attempt (success or failure)
+    try {
+      await this.closeBrowser();
+    } catch (closeError) {
+      if (this.debugMode) console.log("⚠️ Error closing browser:", closeError.message);
     }
   }
 
@@ -553,6 +610,77 @@ class GMAuth {
 
     const page = await this.context.newPage();
     this.currentPage = page;
+
+    // Minimize the browser window after creating the page
+    try {
+      // Try multiple approaches to minimize the window
+
+      // Method 1: Use Playwright's built-in page methods
+      try {
+        await page.setViewportSize({ width: 1, height: 1 });
+        if (this.debugMode) console.log("🔽 Set minimal viewport size");
+      } catch (e) {
+        if (this.debugMode) console.log("⚠️ Could not set minimal viewport:", e.message);
+      }
+
+      // // Method 2: Use browser window manipulation via CDP
+      // try {
+      //   const client = await page.context().newCDPSession(page);
+      //   await client.send("Browser.getWindowForTarget", { targetId: page.target()._targetId });
+      //   const windowInfo = await client.send("Browser.getWindowBounds", { windowId: 1 });
+      //   await client.send("Browser.setWindowBounds", {
+      //     windowId: 1,
+      //     bounds: {
+      //       left: -1000,
+      //       top: -1000,
+      //       width: 100,
+      //       height: 100,
+      //       windowState: "minimized",
+      //     },
+      //   });
+      //   await client.detach();
+      //   if (this.debugMode) console.log("🔽 Used CDP to minimize window");
+      // } catch (e) {
+      //   if (this.debugMode) console.log("⚠️ CDP window minimization failed:", e.message);
+      // }
+
+      // Method 3: JavaScript window manipulation (fallback)
+      try {
+        await page.evaluate(() => {
+          try {
+            // Try various window minimization methods
+            if (typeof window.minimize === "function") {
+              window.minimize();
+              return "minimize()";
+            }
+            if (window.external && typeof window.external.minimize === "function") {
+              window.external.minimize();
+              return "external.minimize()";
+            }
+            if (typeof window.showMinimized === "function") {
+              window.showMinimized();
+              return "showMinimized()";
+            }
+            // Move window off-screen and make it tiny
+            if (typeof window.resizeTo === "function" && typeof window.moveTo === "function") {
+              window.resizeTo(1, 1);
+              window.moveTo(-2000, -2000);
+              return "resizeTo/moveTo";
+            }
+            return "no method worked";
+          } catch (err) {
+            return "error: " + err.message;
+          }
+        });
+        if (this.debugMode) console.log("🔽 Applied JavaScript window manipulation");
+      } catch (e) {
+        if (this.debugMode) console.log("⚠️ JavaScript window manipulation failed:", e.message);
+      }
+
+      if (this.debugMode) console.log("🔽 Browser window minimization attempts completed");
+    } catch (error) {
+      if (this.debugMode) console.log("⚠️ Overall window minimization failed:", error.message);
+    }
 
     const client = await page.context().newCDPSession(page);
     await client.send("Network.enable");
