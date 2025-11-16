@@ -1126,7 +1126,8 @@ class GMAuth {
       response_types: ["code"],
       token_endpoint_auth_method: "none",
     });
-    client[custom.clock_tolerance] = 5;
+    // Increase tolerance to handle server/client clock skew and nbf slightly in future
+    client[custom.clock_tolerance] = 120;
     return client;
   }
 
